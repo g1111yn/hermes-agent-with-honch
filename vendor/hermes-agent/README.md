@@ -10,6 +10,7 @@ ships:
 
 - upstream commit lock
 - local patch bundle
+- overlay files for untracked runtime additions
 - bootstrap script
 
 ## Files
@@ -18,6 +19,9 @@ ships:
   pinned upstream commit to materialize from
 - `patches/0001-hermes-local-customizations.patch`
   local patch bundle generated from the current customized Hermes tree
+- `overlay/`
+  runtime files that must be copied verbatim after patch apply
+  (used for untracked additions like new modules)
 
 ## Materialization
 
