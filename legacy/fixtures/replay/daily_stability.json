@@ -1,0 +1,10 @@
+{
+  "name": "daily_stability",
+  "prompts": [
+    "Hi, this is our first conversation. What should I call you?",
+    "You can call me Aster. I like rainy evenings and slow conversations.",
+    "I had a long work day and I am more tired than I expected.",
+    "Tomorrow remind me to keep the pace gentle instead of cramming too much.",
+    "Before we stop, tell me what impression you have of me so far."
+  ]
+}

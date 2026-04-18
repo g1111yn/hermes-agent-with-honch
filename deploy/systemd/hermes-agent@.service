@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes Agent host service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/hermes-persona/runtime/hermes-agent
+EnvironmentFile=/opt/hermes-persona/deploy/host/hermes-host.env
+ExecStart=/opt/hermes-persona/runtime/hermes-agent/venv/bin/hermes gateway
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

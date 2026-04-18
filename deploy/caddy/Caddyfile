@@ -1,0 +1,8 @@
+{$PUBLIC_DOMAIN} {
+    encode gzip zstd
+
+    @gateway path /wechat/* /healthz
+    handle @gateway {
+        reverse_proxy wechat-gateway:8080
+    }
+}

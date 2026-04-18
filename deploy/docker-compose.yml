@@ -1,0 +1,123 @@
+services:
+  wechat-gateway:
+    build:
+      context: ../apps/wechat-gateway
+      dockerfile: Dockerfile
+    container_name: hermes-wechat-gateway
+    env_file:
+      - .env.shared
+      - .env.interface
+      - .env.providers
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ../data/wechat-gateway:/app/data
+    restart: unless-stopped
+
+  honcho-api:
+    build:
+      context: https://github.com/plastic-labs/honcho.git#main
+      dockerfile: Dockerfile
+    container_name: hermes-honcho-api
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@postgres:5432/postgres
+      CACHE_URL: redis://redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+    env_file:
+      - .env.honcho
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  honcho-deriver:
+    build:
+      context: https://github.com/plastic-labs/honcho.git#main
+      dockerfile: Dockerfile
+    container_name: hermes-honcho-deriver
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@postgres:5432/postgres
+      CACHE_URL: redis://redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+    env_file:
+      - .env.honcho
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/python -c 'import pathlib; print(pathlib.Path(\"/proc/1/cmdline\").read_text())' | grep -q 'src.deriver'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  postgres:
+    image: pgvector/pgvector:pg15
+    container_name: hermes-honcho-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5434:5432"
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ../database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - honcho-pgdata:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8.2
+    container_name: hermes-honcho-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - honcho-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  caddy:
+    image: caddy:2.10
+    container_name: hermes-caddy
+    depends_on:
+      - wechat-gateway
+    env_file:
+      - .env.shared
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    restart: unless-stopped
+
+volumes:
+  honcho-pgdata:
+  honcho-redis-data:
+  caddy-data:
+  caddy-config:

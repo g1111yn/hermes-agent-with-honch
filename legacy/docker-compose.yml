@@ -1,0 +1,84 @@
+services:
+  honcho-api:
+    build:
+      context: https://github.com/plastic-labs/honcho.git#main
+      dockerfile: Dockerfile
+    container_name: hermes-honcho-api
+    entrypoint: ["sh", "docker/entrypoint.sh"]
+    depends_on:
+      honcho-database:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@honcho-database:5432/postgres
+      CACHE_URL: redis://honcho-redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+    env_file:
+      - .env.honcho
+    restart: unless-stopped
+
+  honcho-deriver:
+    build:
+      context: https://github.com/plastic-labs/honcho.git#main
+      dockerfile: Dockerfile
+    container_name: hermes-honcho-deriver
+    entrypoint: ["/app/.venv/bin/python", "-m", "src.deriver"]
+    depends_on:
+      honcho-database:
+        condition: service_healthy
+      honcho-redis:
+        condition: service_healthy
+    environment:
+      DB_CONNECTION_URI: postgresql+psycopg://postgres:postgres@honcho-database:5432/postgres
+      CACHE_URL: redis://honcho-redis:6379/0?suppress=true
+      CACHE_ENABLED: "true"
+    env_file:
+      - .env.honcho
+    healthcheck:
+      test: ["CMD-SHELL", "/app/.venv/bin/python -c 'import pathlib; print(pathlib.Path(\"/proc/1/cmdline\").read_text())' | grep -q 'src.deriver'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  honcho-database:
+    image: pgvector/pgvector:pg15
+    container_name: hermes-honcho-db
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5434:5432"
+    command: ["postgres", "-c", "max_connections=200"]
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - honcho-pgdata:/var/lib/postgresql/data/
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  honcho-redis:
+    image: redis:8.2
+    container_name: hermes-honcho-redis
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - honcho-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  honcho-pgdata:
+  honcho-redis-data:
