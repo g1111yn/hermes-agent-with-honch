@@ -1,0 +1,15 @@
+{
+  "initiative_style": "proactive",
+  "social_energy": "warm",
+  "weather_attention": "contextual",
+  "news_attention": "proactive",
+  "reminder_attention": "gentle",
+  "nearby_attention": "helpful",
+  "voice_style": "soft",
+  "interest_topics": [
+    "technology",
+    "games",
+    "music",
+    "food"
+  ]
+}

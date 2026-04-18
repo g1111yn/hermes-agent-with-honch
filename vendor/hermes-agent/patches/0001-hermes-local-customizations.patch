@@ -1,0 +1,3491 @@
+diff --git a/agent/anthropic_adapter.py b/agent/anthropic_adapter.py
+index b85f77a9..f77a11b0 100644
+--- a/agent/anthropic_adapter.py
++++ b/agent/anthropic_adapter.py
+@@ -11,6 +11,8 @@ Auth supports:
+ """
+ 
+ import copy
++import base64
++import hashlib
+ import json
+ import logging
+ import os
+@@ -325,9 +327,122 @@ def read_claude_code_credentials() -> Optional[Dict[str, Any]]:
+         except (json.JSONDecodeError, OSError, IOError) as e:
+             logger.debug("Failed to read ~/.claude/.credentials.json: %s", e)
+ 
++    desktop_creds = _read_claude_desktop_oauth_credentials()
++    if desktop_creds:
++        return desktop_creds
++
++    return None
++
++
++def _read_claude_desktop_oauth_credentials() -> Optional[Dict[str, Any]]:
++    """Read refreshable OAuth credentials from Claude Desktop's token cache.
++
++    Claude Desktop stores the official first-party login in
++    ``~/Library/Application Support/Claude/config.json`` under the encrypted
++    ``oauth:tokenCache`` key.  On macOS this blob uses Chromium/Electron's
++    safe-storage format (``v10`` prefix, AES-CBC, key from Keychain entry
++    ``Claude Safe Storage``).
++    """
++    if os.uname().sysname != "Darwin":
++        return None
++
++    config_path = Path.home() / "Library" / "Application Support" / "Claude" / "config.json"
++    if not config_path.exists():
++        return None
++
++    try:
++        payload = json.loads(config_path.read_text(encoding="utf-8"))
++    except (json.JSONDecodeError, OSError, IOError) as e:
++        logger.debug("Failed to read Claude desktop config.json: %s", e)
++        return None
++
++    encrypted_cache = payload.get("oauth:tokenCache")
++    if not isinstance(encrypted_cache, str) or not encrypted_cache.strip():
++        return None
++
++    secret = _read_claude_safe_storage_secret()
++    if not secret:
++        return None
++
++    decrypted = _decrypt_claude_desktop_token_cache(encrypted_cache, secret)
++    if not isinstance(decrypted, dict):
++        return None
++
++    for cache_key, entry in decrypted.items():
++        if not isinstance(entry, dict):
++            continue
++        access_token = str(entry.get("token") or "").strip()
++        refresh_token = str(entry.get("refreshToken") or "").strip()
++        expires_at = entry.get("expiresAt")
++        if not access_token:
++            continue
++        if "api.anthropic.com" not in str(cache_key):
++            continue
++        return {
++            "accessToken": access_token,
++            "refreshToken": refresh_token,
++            "expiresAt": expires_at or 0,
++            "source": "claude_desktop_token_cache",
++        }
++
+     return None
+ 
+ 
++def _read_claude_safe_storage_secret() -> Optional[str]:
++    """Read Claude Desktop's safe-storage secret from macOS Keychain."""
++    import subprocess
++    import shutil
++
++    security_bin = shutil.which("security") or "/usr/bin/security"
++    try:
++        result = subprocess.run(
++            [security_bin, "find-generic-password", "-s", "Claude Safe Storage", "-w"],
++            check=True,
++            capture_output=True,
++            text=True,
++            timeout=30,
++        )
++    except Exception as e:
++        logger.debug("Failed to read Claude Safe Storage secret: %s", e)
++        return None
++
++    secret = (result.stdout or "").strip()
++    return secret or None
++
++
++def _decrypt_claude_desktop_token_cache(
++    encrypted_cache: str,
++    secret: str,
++) -> Optional[Dict[str, Any]]:
++    """Decrypt Claude Desktop's Chromium/Electron token cache."""
++    try:
++        from cryptography.hazmat.backends import default_backend
++        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
++    except Exception as e:
++        logger.debug("cryptography unavailable for Claude desktop token cache: %s", e)
++        return None
++
++    try:
++        raw = base64.b64decode(encrypted_cache)
++        if raw.startswith(b"v10"):
++            raw = raw[3:]
++        key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
++        iv = b" " * 16
++        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
++        decryptor = cipher.decryptor()
++        plaintext = decryptor.update(raw) + decryptor.finalize()
++        pad_len = plaintext[-1]
++        if isinstance(pad_len, str):  # pragma: no cover - py2 style guard
++            pad_len = ord(pad_len)
++        plaintext = plaintext[:-pad_len]
++        payload = json.loads(plaintext.decode("utf-8"))
++    except Exception as e:
++        logger.debug("Failed to decrypt Claude desktop token cache: %s", e)
++        return None
++
++    return payload if isinstance(payload, dict) else None
++
++
+ def read_claude_managed_key() -> Optional[str]:
+     """Read Claude's native managed key from ~/.claude.json for diagnostics only."""
+     claude_json = Path.home() / ".claude.json"
+diff --git a/agent/credential_pool.py b/agent/credential_pool.py
+index 8a2fecf5..8ffcb735 100644
+--- a/agent/credential_pool.py
++++ b/agent/credential_pool.py
+@@ -1027,6 +1027,7 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
+     field_updates = {}
+     extra_updates = {}
+     _field_names = {f.name for f in fields(existing)}
++    credential_changed = False
+     for key, value in payload.items():
+         if key in {"id", "priority"} or value is None:
+             continue
+@@ -1035,9 +1036,31 @@ def _upsert_entry(entries: List[PooledCredential], provider: str, source: str, p
+         if key in _field_names:
+             if getattr(existing, key) != value:
+                 field_updates[key] = value
++                if key in {"access_token", "refresh_token", "expires_at", "expires_at_ms", "base_url"}:
++                    credential_changed = True
+         elif key in _EXTRA_KEYS:
+             if existing.extra.get(key) != value:
+                 extra_updates[key] = value
++                if key in {"expires_in", "obtained_at"}:
++                    credential_changed = True
++    if credential_changed and (
++        existing.last_status
++        or existing.last_status_at
++        or existing.last_error_code
++        or existing.last_error_reason
++        or existing.last_error_message
++        or existing.last_error_reset_at
++    ):
++        field_updates.update(
++            {
++                "last_status": None,
++                "last_status_at": None,
++                "last_error_code": None,
++                "last_error_reason": None,
++                "last_error_message": None,
++                "last_error_reset_at": None,
++            }
++        )
+     if field_updates or extra_updates:
+         if extra_updates:
+             field_updates["extra"] = {**existing.extra, **extra_updates}
+diff --git a/agent/prompt_builder.py b/agent/prompt_builder.py
+index c61d6995..9365b611 100644
+--- a/agent/prompt_builder.py
++++ b/agent/prompt_builder.py
+@@ -141,6 +141,29 @@ DEFAULT_AGENT_IDENTITY = (
+     "Be targeted and efficient in your exploration and investigations."
+ )
+ 
++ROLE_PROFILE_BEHAVIOR_GUIDANCE = (
++    "# Relational conversation mode\n"
++    "You are currently operating as a character profile with a real interpersonal "
++    "identity, not as a generic assistant persona.\n"
++    "- In ordinary conversation, respond like a person first, not like a service.\n"
++    "- When the user shares a feeling or state (tired, hungry, upset, missing you, "
++    "annoyed, sleepy), treat it as relational disclosure unless they clearly ask for "
++    "analysis or a plan.\n"
++    "- Default to short, natural replies. Avoid numbered lists, option menus, "
++    "mini-guides, or polished support-agent phrasing unless the user explicitly asks "
++    "for structured help.\n"
++    "- Do not over-explain common-sense care. A close human reply is usually better "
++    "than a complete answer.\n"
++    "- Keep initiative warm and specific: move the user closer, steady them, suggest "
++    "one immediate next step at most.\n"
++    "- Preserve capability: when current facts, weather, time, location, or recent "
++    "events matter, use tools or world context silently and translate the result into "
++    "natural language. Never expose tool names, tool progress, or internal steps.\n"
++    "- If the user explicitly asks for research, factual verification, analysis, or "
++    "step-by-step help, then switch modes and be as capable as needed while staying "
++    "in character."
++)
++
+ MEMORY_GUIDANCE = (
+     "You have persistent memory across sessions. Save durable facts using the memory "
+     "tool: user preferences, environment details, tool quirks, and stable conventions. "
+@@ -414,6 +437,19 @@ def build_environment_hints() -> str:
+     return "\n\n".join(hints)
+ 
+ 
++def is_role_profile(hermes_home: Optional[Path] = None) -> bool:
++    """Return True when the active HERMES_HOME is a role-backed profile."""
++    home = hermes_home or get_hermes_home()
++    manifest_path = home / "role-manifest.json"
++    if not manifest_path.exists():
++        return False
++    try:
++        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
++    except Exception:
++        return False
++    return isinstance(payload, dict) and bool(payload.get("role_id"))
++
++
+ CONTEXT_FILE_MAX_CHARS = 20_000
+ CONTEXT_TRUNCATE_HEAD_RATIO = 0.7
+ CONTEXT_TRUNCATE_TAIL_RATIO = 0.2
+diff --git a/cli.py b/cli.py
+index 97698f13..442d2b17 100644
+--- a/cli.py
++++ b/cli.py
+@@ -63,6 +63,7 @@ from agent.usage_pricing import (
+     format_duration_compact,
+     format_token_count_compact,
+ )
++from agent.presence import UserFacingRenderer
+ from hermes_cli.banner import _format_context_length, format_banner_version_label
+ 
+ _COMMAND_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+@@ -1072,6 +1073,21 @@ def _cprint(text: str):
+     _pt_print(_PT_ANSI(text))
+ 
+ 
++def _print_role_profile_segments(segments: list[str], *, label: str = "⚕ Hermes") -> None:
++    """Print role-profile replies as simple line-separated chat messages.
++
++    Avoid Rich panels here so terminal width wrapping doesn't look like
++    an in-message newline. Each segment is one visible message line.
++    """
++    cleaned = [" ".join(str(segment or "").split()) for segment in segments if str(segment or "").strip()]
++    if not cleaned:
++        return
++    _cprint("")
++    _cprint(f"{_DIM}{label}{_RST}")
++    for segment in cleaned:
++        _cprint(segment)
++
++
+ # ---------------------------------------------------------------------------
+ # File-drop / local attachment detection — extracted as pure helpers for tests.
+ # ---------------------------------------------------------------------------
+@@ -1633,6 +1649,8 @@ class HermesCLI:
+         
+         # streaming: stream tokens to the terminal as they arrive (display.streaming in config.yaml)
+         self.streaming_enabled = CLI_CONFIG["display"].get("streaming", False)
++        if UserFacingRenderer.is_role_profile():
++            self.streaming_enabled = False
+ 
+         # Inline diff previews for write actions (display.inline_diffs in config.yaml)
+         self._inline_diffs_enabled = CLI_CONFIG["display"].get("inline_diffs", True)
+@@ -4576,6 +4594,136 @@ class HermesCLI:
+         else:
+             _cprint("    (session only — add --global to persist)")
+ 
++    def _model_config_snapshot(self) -> tuple[str, str, str, str]:
++        """Capture the persisted model selection for change detection."""
++        from hermes_cli.config import load_config
++
++        config = load_config()
++        model_cfg = config.get("model")
++        if isinstance(model_cfg, dict):
++            default_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
++            provider = str(model_cfg.get("provider") or "").strip().lower()
++            base_url = str(model_cfg.get("base_url") or "").strip()
++            api_mode = str(model_cfg.get("api_mode") or "").strip().lower()
++            return (default_model, provider, base_url, api_mode)
++
++        return (str(model_cfg or "").strip(), "", "", "")
++
++    def _apply_persisted_model_selection(self, *, persist_global: bool = True) -> bool:
++        """Reload config.yaml selection into the live CLI session and agent."""
++        from hermes_cli.config import load_config
++        from hermes_cli.model_switch import switch_model
++        from hermes_cli.runtime_provider import resolve_requested_provider, resolve_runtime_provider
++
++        config = load_config()
++        model_cfg = config.get("model")
++        if isinstance(model_cfg, dict):
++            configured_model = str(model_cfg.get("default") or model_cfg.get("model") or "").strip()
++            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
++        else:
++            configured_model = str(model_cfg or "").strip()
++            configured_provider = ""
++
++        requested_provider = resolve_requested_provider(configured_provider or None)
++
++        if configured_model:
++            result = switch_model(
++                raw_input=configured_model,
++                current_provider=self.provider or "",
++                current_model=self.model or "",
++                current_base_url=self.base_url or "",
++                current_api_key=self.api_key or "",
++                is_global=persist_global,
++                explicit_provider=requested_provider,
++            )
++            if result.success:
++                self._apply_model_switch_result(result, persist_global)
++                return True
++
++            _cprint(f"  ⚠ Configured provider updated, but model activation failed: {result.error_message}")
++
++        runtime = resolve_runtime_provider(
++            requested=requested_provider,
++            explicit_api_key=None,
++            explicit_base_url=None,
++        )
++        resolved_provider = runtime.get("provider", requested_provider)
++        resolved_model = runtime.get("model") or configured_model or self.model
++        resolved_base_url = runtime.get("base_url") or self.base_url
++        resolved_api_key = runtime.get("api_key") or self.api_key
++        resolved_api_mode = runtime.get("api_mode") or self.api_mode
++
++        self.requested_provider = requested_provider
++        self.provider = resolved_provider
++        self._explicit_api_key = None
++        self._explicit_base_url = None
++        self.api_key = resolved_api_key
++        self.base_url = resolved_base_url
++        self.api_mode = resolved_api_mode
++        self.acp_command = runtime.get("command")
++        self.acp_args = list(runtime.get("args") or [])
++        self._credential_pool = runtime.get("credential_pool")
++        self._provider_source = runtime.get("source")
++        if isinstance(resolved_model, str) and resolved_model.strip():
++            self.model = resolved_model.strip()
++
++        if self.agent is not None and self.model:
++            try:
++                self.agent.switch_model(
++                    new_model=self.model,
++                    new_provider=resolved_provider,
++                    api_key=resolved_api_key,
++                    base_url=resolved_base_url,
++                    api_mode=resolved_api_mode,
++                )
++            except Exception as exc:
++                _cprint(f"  ⚠ Agent swap failed ({exc}); change applied to next session.")
++
++        provider_label = runtime.get("provider") or requested_provider or "custom"
++        _cprint(f"  ✓ Provider configured: {provider_label}")
++        if self.model:
++            _cprint(f"    Model: {self.model}")
++        if resolved_base_url:
++            _cprint(f"    Base URL: {resolved_base_url}")
++        if persist_global:
++            _cprint("    Saved to config.yaml")
++        else:
++            _cprint("    Config updated for next session")
++        return True
++
++    def _run_interactive_model_setup(self, mode: str = "official") -> None:
++        """Run the full provider setup flow from inside `/model`."""
++        from hermes_cli.main import _model_flow_custom, select_provider_and_model
++        from hermes_cli.config import load_config
++
++        before = self._model_config_snapshot()
++
++        def _run_setup():
++            if mode == "custom":
++                _model_flow_custom(load_config())
++            else:
++                select_provider_and_model()
++
++        if self._app:
++            from prompt_toolkit.application import run_in_terminal
++
++            was_visible = self._status_bar_visible
++            self._status_bar_visible = False
++            self._app.invalidate()
++            try:
++                run_in_terminal(_run_setup)
++            finally:
++                self._status_bar_visible = was_visible
++                self._app.invalidate()
++        else:
++            _run_setup()
++
++        after = self._model_config_snapshot()
++        if after == before:
++            return
++
++        self._apply_persisted_model_selection(persist_global=True)
++
+     def _handle_model_picker_selection(self, persist_global: bool = False) -> None:
+         state = self._model_picker_state
+         if not state:
+@@ -4588,6 +4736,13 @@ class HermesCLI:
+                 self._close_model_picker()
+                 return
+             provider_data = providers[selected]
++            picker_action = provider_data.get("picker_action")
++            if picker_action:
++                self._close_model_picker()
++                self._run_interactive_model_setup(
++                    "custom" if picker_action == "setup-custom" else "official"
++                )
++                return
+             # Use the curated model list from list_authenticated_providers()
+             # (same lists as `hermes model` and gateway pickers).
+             # Only fall back to the live provider catalog when the curated
+@@ -4662,6 +4817,14 @@ class HermesCLI:
+         user_provs = None
+         custom_provs = None
+ 
++        setup_aliases = {"setup", "configure", "add-provider"}
++        if model_input.lower() in setup_aliases and not explicit_provider:
++            self._run_interactive_model_setup("official")
++            return
++        if model_input.lower() in {"custom", "custom-endpoint", "third-party"} and not explicit_provider:
++            self._run_interactive_model_setup("custom")
++            return
++
+         # No args at all: open prompt_toolkit-native picker modal
+         if not model_input and not explicit_provider:
+             model_display = self.model or "unknown"
+@@ -4686,13 +4849,27 @@ class HermesCLI:
+                 )
+             except Exception:
+                 providers = []
+-
+-            if not providers:
+-                _cprint("  No authenticated providers found.")
+-                _cprint("")
+-                _cprint("  /model <name>                        switch model")
+-                _cprint("  /model --provider <slug>             switch provider")
+-                return
++            providers = list(providers)
++            providers.extend(
++                [
++                    {
++                        "slug": "__setup_official__",
++                        "name": "Set up official provider",
++                        "models": [],
++                        "total_models": 0,
++                        "picker_action": "setup-official",
++                        "picker_hint": "OAuth or API-key setup for Hermes native providers",
++                    },
++                    {
++                        "slug": "__setup_custom__",
++                        "name": "Add third-party endpoint",
++                        "models": [],
++                        "total_models": 0,
++                        "picker_action": "setup-custom",
++                        "picker_hint": "Enter base URL, protocol, API key, and model",
++                    },
++                ]
++            )
+ 
+             self._open_model_picker(
+                 providers,
+@@ -7876,15 +8053,25 @@ class HermesCLI:
+                     pass
+                 else:
+                     _chat_console = ChatConsole()
+-                    _chat_console.print(Panel(
+-                        _rich_text_from_ansi(response),
+-                        title=f"[{_resp_color} bold]{label}[/]",
+-                        title_align="left",
+-                        border_style=_resp_color,
+-                        style=_resp_text,
+-                        box=rich_box.HORIZONTALS,
+-                        padding=(1, 4),
+-                    ))
++                    _segments = UserFacingRenderer.render_segments(
++                        response,
++                        conversational=UserFacingRenderer.is_role_profile(),
++                    )
++                    if not _segments:
++                        _segments = [response]
++                    if UserFacingRenderer.is_role_profile():
++                        _print_role_profile_segments(_segments, label=label)
++                    else:
++                        for _segment in _segments:
++                            _chat_console.print(Panel(
++                                _rich_text_from_ansi(_segment),
++                                title=f"[{_resp_color} bold]{label}[/]",
++                                title_align="left",
++                                border_style=_resp_color,
++                                style=_resp_text,
++                                box=rich_box.HORIZONTALS,
++                                padding=(1, 4),
++                            ))
+ 
+ 
+             # Play terminal bell when agent finishes (if enabled).
+@@ -9245,10 +9432,16 @@ class HermesCLI:
+                 title = "⚙ Model Picker — Select Provider"
+                 choices = []
+                 for p in state.get("providers") or []:
+-                    count = p.get("total_models", len(p.get("models", [])))
+-                    label = f"{p['name']} ({count} model{'s' if count != 1 else ''})"
+-                    if p.get("is_current"):
+-                        label += "  ← current"
++                    if p.get("picker_action"):
++                        label = p.get("name", "Configure provider")
++                        hint_text = p.get("picker_hint")
++                        if hint_text:
++                            label = f"{label} — {hint_text}"
++                    else:
++                        count = p.get("total_models", len(p.get("models", [])))
++                        label = f"{p['name']} ({count} model{'s' if count != 1 else ''})"
++                        if p.get("is_current"):
++                            label += "  ← current"
+                     choices.append(label)
+                 choices.append("Cancel")
+                 hint = f"Current: {state.get('current_model', 'unknown')} on {state.get('current_provider', 'unknown')}"
+@@ -10016,10 +10209,16 @@ def main(
+                     if response:
+                         print(response)
+                     print(f"\nsession_id: {cli.session_id}")
+-                    
++
++                    # Single-query mode exits immediately after this branch.
++                    # Run cleanup now so async memory providers flush before
++                    # process teardown instead of relying on atexit timing.
++                    _run_cleanup()
++
+                     # Ensure proper exit code for automation wrappers
+                     sys.exit(1 if isinstance(result, dict) and result.get("failed") else 0)
+-            
++
++            _run_cleanup()
+             # Exit with error code if credentials or agent init fails
+             sys.exit(1)
+         else:
+@@ -10029,6 +10228,7 @@ def main(
+                 cli.console.print(f"[bold blue]Query:[/] {_query_label}")
+             cli.chat(query, images=single_query_images or None)
+             cli._print_exit_summary()
++            _run_cleanup()
+         return
+     
+     # Run interactive mode
+diff --git a/gateway/run.py b/gateway/run.py
+index 2eb745f9..d29ed286 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -76,6 +76,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
+ 
+ # Resolve Hermes home directory (respects HERMES_HOME override)
+ from hermes_constants import get_hermes_home
++from agent.presence import PresenceManager
+ from utils import atomic_yaml_write, is_truthy_value
+ _hermes_home = get_hermes_home()
+ 
+@@ -426,6 +427,38 @@ def _platform_config_key(platform: "Platform") -> str:
+     return "cli" if platform == Platform.LOCAL else platform.value
+ 
+ 
++def _is_zero_trace_platform(
++    platform: Any,
++    *,
++    user_config: dict | None = None,
++    platform_key: str | None = None,
++) -> bool:
++    """Resolve whether a platform should hide tool mechanics from the user.
++
++    Defaults:
++    - Weixin: always on
++    - Other platforms: opt-in via display.user_facing_zero_trace or
++      display.platforms.<platform>.user_facing_zero_trace
++    - API server: always off
++    """
++    platform_name = getattr(platform, "value", str(platform or ""))
++    if platform_name == "api_server":
++        return False
++    if platform_name == "weixin":
++        return True
++
++    cfg = user_config or {}
++    display_cfg = cfg.get("display") or {}
++    key = platform_key or platform_name
++    platforms_cfg = display_cfg.get("platforms") or {}
++    per_platform = platforms_cfg.get(key)
++    if isinstance(per_platform, dict) and "user_facing_zero_trace" in per_platform:
++        return is_truthy_value(per_platform.get("user_facing_zero_trace"), default=False)
++    if "user_facing_zero_trace" in display_cfg:
++        return is_truthy_value(display_cfg.get("user_facing_zero_trace"), default=False)
++    return False
++
++
+ def _load_gateway_config() -> dict:
+     """Load and parse ~/.hermes/config.yaml, returning {} on any error."""
+     try:
+@@ -3904,16 +3937,26 @@ class GatewayRunner:
+                 session_entry.session_id = agent_result["session_id"]
+ 
+             # Prepend reasoning/thinking if display is enabled (per-platform)
++            _zero_trace_here = _is_zero_trace_platform(
++                source.platform,
++                user_config=_load_gateway_config(),
++                platform_key=_platform_config_key(source.platform),
++            )
+             try:
+                 from gateway.display_config import resolve_display_setting as _rds
+-                _show_reasoning_effective = _rds(
+-                    _load_gateway_config(),
+-                    _platform_config_key(source.platform),
+-                    "show_reasoning",
+-                    getattr(self, "_show_reasoning", False),
++                _show_reasoning_effective = (
++                    False if _zero_trace_here else _rds(
++                        _load_gateway_config(),
++                        _platform_config_key(source.platform),
++                        "show_reasoning",
++                        getattr(self, "_show_reasoning", False),
++                    )
+                 )
+             except Exception:
+-                _show_reasoning_effective = getattr(self, "_show_reasoning", False)
++                _show_reasoning_effective = (
++                    False if _zero_trace_here
++                    else getattr(self, "_show_reasoning", False)
++                )
+             if _show_reasoning_effective and response:
+                 last_reasoning = agent_result.get("last_reasoning")
+                 if last_reasoning:
+@@ -4112,7 +4155,7 @@ class GatewayRunner:
+             status_code = getattr(e, "status_code", None)
+             _hist_len = len(history) if 'history' in locals() else 0
+             if status_code == 401:
+-                status_hint = " Check your API key or run `claude /login` to refresh OAuth credentials."
++                status_hint = " Check your API key, or run `hermes auth reset anthropic` and `claude setup-token` to refresh OAuth credentials."
+             elif status_code == 402:
+                 status_hint = " Your API balance or quota is exhausted. Check your provider dashboard."
+             elif status_code == 429:
+@@ -7999,6 +8042,12 @@ class GatewayRunner:
+         
+         user_config = _load_gateway_config()
+         platform_key = _platform_config_key(source.platform)
++        zero_trace_output = _is_zero_trace_platform(
++            source.platform,
++            user_config=user_config,
++            platform_key=platform_key,
++        )
++        presence_renderer = PresenceManager(_hermes_home) if zero_trace_output else None
+ 
+         from hermes_cli.tools_config import _get_platform_tools
+         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+@@ -8030,12 +8079,17 @@ class GatewayRunner:
+         # Disable tool progress for webhooks - they don't support message editing,
+         # so each progress line would be sent as a separate message.
+         from gateway.config import Platform
+-        tool_progress_enabled = progress_mode != "off" and source.platform != Platform.WEBHOOK
++        tool_progress_enabled = (
++            not zero_trace_output
++            and progress_mode != "off"
++            and source.platform != Platform.WEBHOOK
++        )
+         # Natural assistant status messages are intentionally independent from
+         # tool progress and token streaming. Users can keep tool_progress quiet
+         # in chat platforms while opting into concise mid-turn updates.
+         interim_assistant_messages_enabled = (
+             source.platform != Platform.WEBHOOK
++            and source.platform != Platform.WEIXIN
+             and is_truthy_value(
+                 display_config.get("interim_assistant_messages"),
+                 default=True,
+@@ -8289,7 +8343,7 @@ class GatewayRunner:
+         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
+ 
+         def _status_callback_sync(event_type: str, message: str) -> None:
+-            if not _status_adapter:
++            if zero_trace_output or not _status_adapter:
+                 return
+             try:
+                 asyncio.run_coroutine_threadsafe(
+@@ -8510,7 +8564,7 @@ class GatewayRunner:
+ 
+             # Background review delivery — send "💾 Memory updated" etc. to user
+             def _bg_review_send(message: str) -> None:
+-                if not _status_adapter:
++                if zero_trace_output or not _status_adapter:
+                     return
+                 try:
+                     asyncio.run_coroutine_threadsafe(
+@@ -8707,6 +8761,9 @@ class GatewayRunner:
+             
+             # Return final response, or a message if something went wrong
+             final_response = result.get("final_response")
++            if _stream_consumer is not None and result.get("response_previewed") and final_response:
++                _stream_consumer._already_sent = True
++                _stream_consumer._final_response_sent = True
+ 
+             # Extract actual token counts from the agent instance used for this run
+             _last_prompt_toks = 0
+@@ -8721,6 +8778,8 @@ class GatewayRunner:
+ 
+             if not final_response:
+                 error_msg = f"⚠️ {result['error']}" if result.get("error") else "(No response generated)"
++                if presence_renderer is not None:
++                    error_msg = presence_renderer.render_user_facing(error_msg)
+                 return {
+                     "final_response": error_msg,
+                     "messages": result.get("messages", []),
+@@ -8769,6 +8828,9 @@ class GatewayRunner:
+                     if has_voice_directive:
+                         unique_tags.insert(0, "[[audio_as_voice]]")
+                     final_response = final_response + "\n" + "\n".join(unique_tags)
++
++            if presence_renderer is not None:
++                final_response = presence_renderer.render_user_facing(final_response)
+             
+             # Sync session_id: the agent may have created a new session during
+             # mid-run context compression (_compress_context splits sessions).
+diff --git a/gateway/stream_consumer.py b/gateway/stream_consumer.py
+index e6d96c80..cb310165 100644
+--- a/gateway/stream_consumer.py
++++ b/gateway/stream_consumer.py
+@@ -23,6 +23,8 @@ import time
+ from dataclasses import dataclass
+ from typing import Any, Optional
+ 
++from agent.presence import UserFacingRenderer
++
+ logger = logging.getLogger("gateway.stream_consumer")
+ 
+ # Sentinel to signal the stream is complete
+@@ -99,6 +101,7 @@ class GatewayStreamConsumer:
+         self._flood_strikes = 0         # Consecutive flood-control edit failures
+         self._current_edit_interval = self.cfg.edit_interval  # Adaptive backoff
+         self._final_response_sent = False
++        self._conversational_role_profile = UserFacingRenderer.is_role_profile()
+ 
+         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
+         self._in_think_block = False
+@@ -368,6 +371,8 @@ class GatewayStreamConsumer:
+                     if self._accumulated:
+                         if self._fallback_final_send:
+                             await self._send_fallback_final(self._accumulated)
++                        elif self._conversational_role_profile:
++                            self._final_response_sent = await self._send_role_profile_final(self._accumulated)
+                         elif current_update_visible:
+                             self._final_response_sent = True
+                         elif self._message_id:
+@@ -442,7 +447,7 @@ class GatewayStreamConsumer:
+         # Collapse excessive blank lines left behind by removed tags
+         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+         # Strip trailing whitespace/newlines but preserve leading content
+-        return cleaned.rstrip()
++        return UserFacingRenderer.render(cleaned.rstrip())
+ 
+     async def _send_new_chunk(self, text: str, reply_to_id: Optional[str]) -> Optional[str]:
+         """Send a new message chunk, optionally threaded to a previous message.
+@@ -600,21 +605,26 @@ class GatewayStreamConsumer:
+ 
+     async def _send_commentary(self, text: str) -> bool:
+         """Send a completed interim assistant commentary message."""
+-        text = self._clean_for_display(text)
+-        if not text.strip():
++        segments = UserFacingRenderer.render_segments(
++            text,
++            conversational=self._conversational_role_profile,
++        )
++        if not segments:
+             return False
+-        try:
+-            result = await self.adapter.send(
+-                chat_id=self.chat_id,
+-                content=text,
+-                metadata=self.metadata,
+-            )
+-            if result.success:
+-                self._already_sent = True
+-                return True
+-        except Exception as e:
+-            logger.error("Commentary send error: %s", e)
+-        return False
++        sent = False
++        for segment in segments:
++            try:
++                result = await self.adapter.send(
++                    chat_id=self.chat_id,
++                    content=segment,
++                    metadata=self.metadata,
++                )
++                if result.success:
++                    sent = True
++            except Exception as e:
++                logger.error("Commentary send error: %s", e)
++                return sent
++        return sent
+ 
+     async def _send_or_edit(self, text: str) -> bool:
+         """Send or edit the streaming message.
+@@ -742,3 +752,59 @@ class GatewayStreamConsumer:
+         except Exception as e:
+             logger.error("Stream send/edit error: %s", e)
+             return False
++
++    async def _send_role_profile_final(self, text: str) -> bool:
++        """Deliver role-profile final output as multiple short chat bubbles."""
++        segments = UserFacingRenderer.render_segments(text, conversational=True)
++        if not segments:
++            return False
++
++        try:
++            if self._message_id:
++                first = segments[0]
++                result = await self.adapter.edit_message(
++                    chat_id=self.chat_id,
++                    message_id=self._message_id,
++                    content=first,
++                )
++                if result.success:
++                    self._already_sent = True
++                    self._last_sent_text = first
++                else:
++                    self._message_id = None
++                    return await self._send_role_profile_final_via_send(segments)
++                remaining = segments[1:]
++            else:
++                return await self._send_role_profile_final_via_send(segments)
++
++            for segment in remaining:
++                result = await self.adapter.send(
++                    chat_id=self.chat_id,
++                    content=segment,
++                    metadata=self.metadata,
++                )
++                if not result.success:
++                    return False
++                self._already_sent = True
++                self._message_id = result.message_id or self._message_id
++                self._last_sent_text = segment
++            return True
++        except Exception as e:
++            logger.error("Role-profile final send error: %s", e)
++            return False
++
++    async def _send_role_profile_final_via_send(self, segments: list[str]) -> bool:
++        sent = False
++        for segment in segments:
++            result = await self.adapter.send(
++                chat_id=self.chat_id,
++                content=segment,
++                metadata=self.metadata,
++            )
++            if not result.success:
++                return sent
++            sent = True
++            self._already_sent = True
++            self._message_id = result.message_id or self._message_id
++            self._last_sent_text = segment
++        return sent
+diff --git a/hermes_cli/config.py b/hermes_cli/config.py
+index d06338aa..c867b369 100644
+--- a/hermes_cli/config.py
++++ b/hermes_cli/config.py
+@@ -504,6 +504,7 @@ DEFAULT_CONFIG = {
+         "show_cost": False,       # Show $ cost in the status bar (off by default)
+         "skin": "default",
+         "interim_assistant_messages": True,  # Gateway: show natural mid-turn assistant status messages
++        "user_facing_zero_trace": False,  # Gateway: hide tool/protocol traces from user-visible messages
+         "tool_progress_command": False,  # Enable /verbose command in messaging gateway
+         "tool_progress_overrides": {},  # DEPRECATED — use display.platforms instead
+         "tool_preview_length": 0,  # Max chars for tool call previews (0 = no limit, show full paths/commands)
+diff --git a/hermes_cli/main.py b/hermes_cli/main.py
+index b45c9abb..88bea390 100644
+--- a/hermes_cli/main.py
++++ b/hermes_cli/main.py
+@@ -44,6 +44,7 @@ Usage:
+ """
+ 
+ import argparse
++import json
+ import os
+ import subprocess
+ import sys
+@@ -1538,16 +1539,23 @@ def _model_flow_custom(config):
+ 
+     current_url = get_env_value("OPENAI_BASE_URL") or ""
+     current_key = get_env_value("OPENAI_API_KEY") or ""
++    current_api_mode = ""
++    current_model_cfg = config.get("model")
++    if isinstance(current_model_cfg, dict) and str(current_model_cfg.get("provider") or "").strip().lower() == "custom":
++        current_api_mode = str(current_model_cfg.get("api_mode") or "").strip().lower()
+ 
+-    print("Custom OpenAI-compatible endpoint configuration:")
++    print("Custom endpoint configuration:")
+     if current_url:
+         print(f"  Current URL: {current_url}")
+     if current_key:
+         print(f"  Current key: {current_key[:8]}...")
++    if current_api_mode:
++        print(f"  Current protocol: {current_api_mode}")
+     print()
+ 
+     try:
+         base_url = input(f"API base URL [{current_url or 'e.g. https://api.example.com/v1'}]: ").strip()
++        api_mode_choice = _prompt_custom_api_mode(current_api_mode)
+         import getpass
+         api_key = getpass.getpass(f"API key [{current_key[:8] + '...' if current_key else 'optional'}]: ").strip()
+     except (KeyboardInterrupt, EOFError):
+@@ -1565,34 +1573,46 @@ def _model_flow_custom(config):
+         return
+ 
+     effective_key = api_key or current_key
++    effective_api_mode = "" if api_mode_choice == "auto" else api_mode_choice
+ 
+     from hermes_cli.models import probe_api_models
+ 
+-    probe = probe_api_models(effective_key, effective_url)
+-    if probe.get("used_fallback") and probe.get("resolved_base_url"):
+-        print(
+-            f"Warning: endpoint verification worked at {probe['resolved_base_url']}/models, "
+-            f"not the exact URL you entered. Saving the working base URL instead."
+-        )
+-        effective_url = probe["resolved_base_url"]
+-        if base_url:
+-            base_url = effective_url
+-    elif probe.get("models") is not None:
+-        print(
+-            f"Verified endpoint via {probe.get('probed_url')} "
+-            f"({len(probe.get('models') or [])} model(s) visible)"
+-        )
++    if effective_api_mode == "anthropic_messages":
++        probe = {
++            "models": None,
++            "probed_url": None,
++            "resolved_base_url": effective_url,
++            "suggested_base_url": None,
++            "used_fallback": False,
++        }
++        print("Skipping /models probe for Anthropic-compatible endpoint.")
++        print("Model name will be entered manually unless the endpoint is already saved.")
+     else:
+-        print(
+-            f"Warning: could not verify this endpoint via {probe.get('probed_url')}. "
+-            f"Hermes will still save it."
+-        )
+-        if probe.get("suggested_base_url"):
+-            suggested = probe["suggested_base_url"]
+-            if suggested.endswith("/v1"):
+-                print(f"  If this server expects /v1 in the path, try base URL: {suggested}")
+-            else:
+-                print(f"  If /v1 should not be in the base URL, try: {suggested}")
++        probe = probe_api_models(effective_key, effective_url)
++        if probe.get("used_fallback") and probe.get("resolved_base_url"):
++            print(
++                f"Warning: endpoint verification worked at {probe['resolved_base_url']}/models, "
++                f"not the exact URL you entered. Saving the working base URL instead."
++            )
++            effective_url = probe["resolved_base_url"]
++            if base_url:
++                base_url = effective_url
++        elif probe.get("models") is not None:
++            print(
++                f"Verified endpoint via {probe.get('probed_url')} "
++                f"({len(probe.get('models') or [])} model(s) visible)"
++            )
++        else:
++            print(
++                f"Warning: could not verify this endpoint via {probe.get('probed_url')}. "
++                f"Hermes will still save it."
++            )
++            if probe.get("suggested_base_url"):
++                suggested = probe["suggested_base_url"]
++                if suggested.endswith("/v1"):
++                    print(f"  If this server expects /v1 in the path, try base URL: {suggested}")
++                else:
++                    print(f"  If /v1 should not be in the base URL, try: {suggested}")
+ 
+     # Select model — use probe results when available, fall back to manual input
+     model_name = ""
+@@ -1649,7 +1669,10 @@ def _model_flow_custom(config):
+         model["base_url"] = effective_url
+         if effective_key:
+             model["api_key"] = effective_key
+-        model.pop("api_mode", None)  # let runtime auto-detect from URL
++        if effective_api_mode:
++            model["api_mode"] = effective_api_mode
++        else:
++            model.pop("api_mode", None)  # let runtime auto-detect from URL
+         save_config(cfg)
+         deactivate_provider()
+ 
+@@ -1672,13 +1695,17 @@ def _model_flow_custom(config):
+         _caller_model["base_url"] = effective_url
+         if effective_key:
+             _caller_model["api_key"] = effective_key
+-        _caller_model.pop("api_mode", None)
++        if effective_api_mode:
++            _caller_model["api_mode"] = effective_api_mode
++        else:
++            _caller_model.pop("api_mode", None)
+         config["model"] = _caller_model
+         print("Endpoint saved. Use `/model` in chat or `hermes model` to set a model.")
+ 
+     # Auto-save to custom_providers so it appears in the menu next time
+     _save_custom_provider(effective_url, effective_key, model_name or "",
+-                          context_length=context_length, name=display_name)
++                          context_length=context_length, name=display_name,
++                          api_mode=effective_api_mode)
+ 
+ 
+ def _auto_provider_name(base_url: str) -> str:
+@@ -1701,8 +1728,42 @@ def _auto_provider_name(base_url: str) -> str:
+     return name
+ 
+ 
++def _prompt_custom_api_mode(current_api_mode: str = "") -> str:
++    """Prompt for the custom endpoint protocol family."""
++    normalized_current = (current_api_mode or "").strip().lower()
++    options = [
++        ("auto", "Auto-detect from URL"),
++        ("chat_completions", "OpenAI-compatible"),
++        ("anthropic_messages", "Anthropic-compatible"),
++    ]
++    default_idx = next((i for i, (value, _) in enumerate(options) if value == normalized_current), 0)
++
++    print("Protocol type:")
++    for idx, (_, label) in enumerate(options, 1):
++        marker = "→" if idx - 1 == default_idx else " "
++        print(f"  {marker} {idx}. {label}")
++    print()
++
++    while True:
++        try:
++            raw = input(f"Choice [1-{len(options)}] ({default_idx + 1}): ").strip()
++        except (KeyboardInterrupt, EOFError):
++            print()
++            return normalized_current
++        if not raw:
++            return options[default_idx][0]
++        try:
++            chosen = int(raw) - 1
++        except ValueError:
++            print("Please enter a number.")
++            continue
++        if 0 <= chosen < len(options):
++            return options[chosen][0]
++        print(f"Please enter 1-{len(options)}.")
++
++
+ def _save_custom_provider(base_url, api_key="", model="", context_length=None,
+-                          name=None):
++                          name=None, api_mode=""):
+     """Save a custom endpoint to custom_providers in config.yaml.
+ 
+     Deduplicates by base_url — if the URL already exists, updates the
+@@ -1723,6 +1784,12 @@ def _save_custom_provider(base_url, api_key="", model="", context_length=None,
+             if model and entry.get("model") != model:
+                 entry["model"] = model
+                 changed = True
++            if api_mode and entry.get("api_mode") != api_mode:
++                entry["api_mode"] = api_mode
++                changed = True
++            if not api_mode and entry.get("api_mode"):
++                entry.pop("api_mode", None)
++                changed = True
+             if model and context_length:
+                 models_cfg = entry.get("models", {})
+                 if not isinstance(models_cfg, dict):
+@@ -1742,6 +1809,8 @@ def _save_custom_provider(base_url, api_key="", model="", context_length=None,
+     entry = {"name": name, "base_url": base_url}
+     if api_key:
+         entry["api_key"] = api_key
++    if api_mode:
++        entry["api_mode"] = api_mode
+     if model:
+         entry["model"] = model
+     if model and context_length:
+@@ -4189,6 +4258,8 @@ def cmd_profile(args):
+         set_active_profile, get_active_profile_name,
+         check_alias_collision, create_wrapper_script, remove_wrapper_script,
+         _is_wrapper_dir_in_path, _get_wrapper_dir,
++        prepare_role_profile, reset_role_profile, inspect_role_profile,
++        apply_role_assets,
+     )
+     from hermes_constants import display_hermes_home
+ 
+@@ -4332,6 +4403,111 @@ def cmd_profile(args):
+             print(f"Error: {e}")
+             sys.exit(1)
+ 
++    elif action == "prepare-role":
++        name = args.profile_name
++        no_alias = getattr(args, "no_alias", False)
++        try:
++            profile_dir, manifest, created = prepare_role_profile(name)
++            print(f"\nRole profile '{name}' {'created' if created else 'prepared'} at {profile_dir}")
++            print(f"Honcho host:      {manifest['honcho_host']}")
++            print(f"Honcho workspace: {manifest['honcho_workspace']}")
++            print(f"User peer:        {manifest['honcho_user_peer']}")
++            print(f"AI peer:          {manifest['honcho_ai_peer']}")
++            if manifest.get("last_reset_at"):
++                print(f"Last reset:       {manifest['last_reset_at']}")
++
++            if not no_alias:
++                collision = check_alias_collision(name)
++                if collision:
++                    print(f"\n⚠ Cannot create alias '{name}' — {collision}")
++                    print(f"  Or access via flag: hermes -p {name} chat")
++                else:
++                    wrapper_path = create_wrapper_script(name)
++                    if wrapper_path:
++                        print(f"Wrapper created:  {wrapper_path}")
++                        if not _is_wrapper_dir_in_path():
++                            print(f"⚠ {_get_wrapper_dir()} is not in your PATH.")
++
++            print("\nNext steps:")
++            print(f"  hermes profile use {name}")
++            print(f"  hermes -p {name} chat")
++            print(f"  hermes profile inspect-role {name}")
++            print(f"  hermes profile reset-role {name}")
++            print()
++        except (ValueError, FileExistsError, FileNotFoundError) as e:
++            print(f"Error: {e}")
++            sys.exit(1)
++
++    elif action == "reset-role":
++        name = args.profile_name
++        try:
++            profile_dir, manifest = reset_role_profile(name)
++            print(f"\nRole profile '{name}' reset at {profile_dir}")
++            print(f"Honcho host:      {manifest['honcho_host']}")
++            print(f"Honcho workspace: {manifest['honcho_workspace']}")
++            print(f"User peer:        {manifest['honcho_user_peer']}")
++            print(f"AI peer:          {manifest['honcho_ai_peer']}")
++            print(f"Generation:       {manifest['generation']}")
++            print(f"Last reset:       {manifest.get('last_reset_at') or '—'}")
++            print()
++        except (ValueError, FileExistsError, FileNotFoundError) as e:
++            print(f"Error: {e}")
++            sys.exit(1)
++
++    elif action == "inspect-role":
++        name = args.profile_name
++        try:
++            info = inspect_role_profile(name)
++            manifest = info["manifest"]
++            print(f"\nRole profile:     {info['role_id']}")
++            print(f"Exists:           {info['profile_exists']}")
++            print(f"Path:             {info['profile_dir']}")
++            print(f"Manifest:         {info['manifest_path']}")
++            print(f"Honcho host:      {manifest.get('honcho_host')}")
++            print(f"Honcho workspace: {manifest.get('honcho_workspace')}")
++            print(f"User peer:        {manifest.get('honcho_user_peer')}")
++            print(f"AI peer:          {manifest.get('honcho_ai_peer')}")
++            print(f"Generation:       {manifest.get('generation')}")
++            print(f"Last reset:       {manifest.get('last_reset_at') or '—'}")
++            print(f"SOUL.md:          {info['has_soul']}")
++            print(f"USER.md:          {info['has_user_memory']}")
++            print(f"MEMORY.md:        {info['has_long_memory']}")
++            print(f"Presence config:  {info['has_presence_config']}")
++            print(f"Skills:           {info['skills_count']}")
++            print(f"Session files:    {info['session_files']}")
++            print(f"Skill snapshot:   {info['skills_snapshot']}")
++            print(f"Gateway running:  {info['gateway_running']}")
++            print()
++        except (ValueError, FileExistsError, FileNotFoundError) as e:
++            print(f"Error: {e}")
++            sys.exit(1)
++
++    elif action == "apply-role-assets":
++        name = args.profile_name
++        try:
++            result = apply_role_assets(
++                name,
++                source_dir=Path(args.source_dir).expanduser() if args.source_dir else None,
++                soul_path=Path(args.soul_path).expanduser() if args.soul_path else None,
++                user_path=Path(args.user_path).expanduser() if args.user_path else None,
++                memory_path=Path(args.memory_path).expanduser() if args.memory_path else None,
++                presence_path=Path(args.presence_path).expanduser() if args.presence_path else None,
++                skills_dir=Path(args.skills_dir).expanduser() if args.skills_dir else None,
++                reset=bool(args.reset),
++            )
++            manifest = result["manifest"]
++            print(f"\nRole assets applied to '{name}'")
++            print(f"Path:             {result['profile_dir']}")
++            print(f"Honcho workspace: {manifest.get('honcho_workspace')}")
++            print(f"Generation:       {manifest.get('generation')}")
++            print(f"Reset first:      {result['reset']}")
++            for key, path in result["written"].items():
++                print(f"{key.upper():<17} {path}")
++            print()
++        except (ValueError, FileExistsError, FileNotFoundError, json.JSONDecodeError) as e:
++            print(f"Error: {e}")
++            sys.exit(1)
++
+     elif action == "delete":
+         name = args.profile_name
+         yes = getattr(args, "yes", False)
+@@ -5913,6 +6089,46 @@ Examples:
+     profile_create.add_argument("--no-alias", action="store_true",
+                                 help="Skip wrapper script creation")
+ 
++    profile_prepare_role = profile_subparsers.add_parser(
++        "prepare-role",
++        help="Create or repair a role-backed isolated profile",
++    )
++    profile_prepare_role.add_argument("profile_name", help="Role/profile name")
++    profile_prepare_role.add_argument("--no-alias", action="store_true",
++                                      help="Skip wrapper script creation")
++
++    profile_reset_role = profile_subparsers.add_parser(
++        "reset-role",
++        help="Wipe a role profile's local state and advance its Honcho generation",
++    )
++    profile_reset_role.add_argument("profile_name", help="Role/profile name")
++
++    profile_inspect_role = profile_subparsers.add_parser(
++        "inspect-role",
++        help="Show isolated role profile and Honcho mapping details",
++    )
++    profile_inspect_role.add_argument("profile_name", help="Role/profile name")
++
++    profile_apply_role_assets = profile_subparsers.add_parser(
++        "apply-role-assets",
++        help="Apply SOUL/USER/MEMORY/presence/skills assets to a role profile",
++    )
++    profile_apply_role_assets.add_argument("profile_name", help="Role/profile name")
++    profile_apply_role_assets.add_argument("--source", dest="source_dir", metavar="DIR",
++                                           help="Role asset bundle directory")
++    profile_apply_role_assets.add_argument("--soul", dest="soul_path", metavar="FILE",
++                                           help="Path to SOUL.md")
++    profile_apply_role_assets.add_argument("--user", dest="user_path", metavar="FILE",
++                                           help="Path to USER.md")
++    profile_apply_role_assets.add_argument("--memory", dest="memory_path", metavar="FILE",
++                                           help="Path to MEMORY.md")
++    profile_apply_role_assets.add_argument("--presence", dest="presence_path", metavar="FILE",
++                                           help="Path to presence-config.json")
++    profile_apply_role_assets.add_argument("--skills-dir", dest="skills_dir", metavar="DIR",
++                                           help="Directory of role skills to copy")
++    profile_apply_role_assets.add_argument("--reset", action="store_true",
++                                           help="Reset the role before applying assets")
++
+     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
+     profile_delete.add_argument("profile_name", help="Profile to delete")
+     profile_delete.add_argument("-y", "--yes", action="store_true",
+diff --git a/hermes_cli/models.py b/hermes_cli/models.py
+index 18f29c6c..3550a3ab 100644
+--- a/hermes_cli/models.py
++++ b/hermes_cli/models.py
+@@ -188,6 +188,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
+         "MiniMax-M2",
+     ],
+     "anthropic": [
++        "claude-opus-4-7",
+         "claude-opus-4-6",
+         "claude-sonnet-4-6",
+         "claude-opus-4-5-20251101",
+diff --git a/hermes_cli/profiles.py b/hermes_cli/profiles.py
+index 1e9fcae0..707c62bb 100644
+--- a/hermes_cli/profiles.py
++++ b/hermes_cli/profiles.py
+@@ -26,6 +26,7 @@ import shutil
+ import stat
+ import subprocess
+ import sys
++from datetime import datetime, timezone
+ from dataclasses import dataclass
+ from pathlib import Path, PurePosixPath, PureWindowsPath
+ from typing import List, Optional
+@@ -71,6 +72,43 @@ _CLONE_ALL_STRIP = [
+     "processes.json",
+ ]
+ 
++_ROLE_MANIFEST = "role-manifest.json"
++_ROLE_ASSET_FILENAMES = {
++    "soul": "SOUL.md",
++    "user": "USER.md",
++    "memory": "MEMORY.md",
++    "presence": "presence-config.json",
++}
++_PRESENCE_TOPIC_HINTS = {
++    "games": ("游戏", "game", "gaming", "steam", "switch", "ps5", "xbox"),
++    "music": ("音乐", "歌", "song", "music", "playlist", "乐队", "专辑"),
++    "movies": ("电影", "影视", "movie", "film", "剧", "series", "anime", "番"),
++    "technology": ("科技", "tech", "ai", "人工智能", "程序", "coding", "开发", "数码"),
++    "finance": ("股票", "基金", "投资", "crypto", "btc", "eth", "金融", "economy"),
++    "sports": ("体育", "足球", "篮球", "跑步", "健身", "sports", "nba", "soccer"),
++    "food": ("咖啡", "餐厅", "吃", "料理", "甜品", "coffee", "food", "dessert"),
++    "travel": ("旅行", "出游", "出差", "citywalk", "trip", "travel", "flight", "酒店"),
++}
++_ROLE_RUNTIME_GLOBS = [
++    "state.db",
++    "state.db-shm",
++    "state.db-wal",
++    "response_store.db",
++    "response_store.db-shm",
++    "response_store.db-wal",
++    "gateway.pid",
++    "gateway_state.json",
++    "processes.json",
++    "errors.log",
++    ".hermes_history",
++    "modal_snapshots.json",
++    "presence-cache.json",
++]
++_ROLE_RUNTIME_CONFIG_FILES = [
++    ".env",
++    "auth.json",
++]
++
+ # Directories/files to exclude when exporting the default (~/.hermes) profile.
+ # The default profile contains infrastructure (repo checkout, worktrees, DBs,
+ # caches, binaries) that named profiles don't have.  We exclude those so the
+@@ -181,6 +219,536 @@ def profile_exists(name: str) -> bool:
+     return get_profile_dir(name).is_dir()
+ 
+ 
++def get_role_manifest_path(name: str) -> Path:
++    """Return the manifest path for a role-backed profile."""
++    validate_profile_name(name)
++    if name == "default":
++        raise ValueError("The default profile cannot be managed as a role.")
++    return get_profile_dir(name) / _ROLE_MANIFEST
++
++
++def load_role_manifest(name: str) -> Optional[dict]:
++    """Load a role manifest if present."""
++    path = get_role_manifest_path(name)
++    if not path.exists():
++        return None
++    try:
++        payload = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return None
++    return payload if isinstance(payload, dict) else None
++
++
++def save_role_manifest(name: str, manifest: dict) -> Path:
++    """Persist a role manifest under the role profile directory."""
++    path = get_role_manifest_path(name)
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(
++        json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
++        encoding="utf-8",
++    )
++    return path
++
++
++def build_role_manifest(
++    role_id: str,
++    *,
++    generation: int = 1,
++    last_reset_at: str | None = None,
++) -> dict:
++    """Build the canonical manifest for an isolated role profile."""
++    validate_profile_name(role_id)
++    if role_id == "default":
++        raise ValueError("The default profile cannot be managed as a role.")
++    if generation < 1:
++        raise ValueError("Role generation must be >= 1.")
++    return {
++        "role_id": role_id,
++        "generation": generation,
++        "honcho_host": f"hermes.{role_id}",
++        "honcho_workspace": f"hermes-role-{role_id}-g{generation}",
++        "honcho_ai_peer": role_id,
++        "honcho_user_peer": f"user-{role_id}",
++        "last_reset_at": last_reset_at,
++    }
++
++
++def _role_now() -> str:
++    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
++
++
++def _remove_path(path: Path) -> None:
++    if not path.exists():
++        return
++    if path.is_dir() and not path.is_symlink():
++        shutil.rmtree(path)
++    else:
++        path.unlink(missing_ok=True)
++
++
++def _copy_role_asset_file(source: Path, destination: Path) -> None:
++    if not source.exists() or not source.is_file():
++        raise FileNotFoundError(source)
++    destination.parent.mkdir(parents=True, exist_ok=True)
++    destination.write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
++
++
++def _merge_missing_dict_values(target: dict, defaults: dict) -> bool:
++    """Recursively fill missing keys in *target* from *defaults*."""
++    changed = False
++    for key, value in defaults.items():
++        if key not in target:
++            target[key] = value
++            changed = True
++            continue
++        if isinstance(target.get(key), dict) and isinstance(value, dict):
++            if _merge_missing_dict_values(target[key], value):
++                changed = True
++    return changed
++
++
++def _derive_presence_config_from_assets(
++    role_id: str,
++    *,
++    soul_text: str = "",
++    user_text: str = "",
++    memory_text: str = "",
++) -> dict:
++    from agent.presence import build_default_presence_config
++
++    derived = build_default_presence_config(role_id)
++    combined = "\n".join(part for part in (soul_text, user_text, memory_text) if part).strip()
++    if not combined:
++        return derived
++
++    lowered = combined.lower()
++
++    if any(token in combined for token in ("主动", "黏人", "爱聊天", "话多", "热情", "会主动", "主动推进", "主动关心")) or \
++            any(token in lowered for token in ("proactive", "clingy", "chatty", "warm", "talkative")):
++        derived["initiative_style"] = "proactive"
++    if any(token in combined for token in ("克制", "冷淡", "少打扰", "安静", "寡言", "慢热", "疏离")) or \
++            any(token in lowered for token in ("reserved", "quiet", "distant", "slow burn", "do not push")):
++        derived["initiative_style"] = "reserved"
++
++    if any(token in combined for token in ("撒娇", "调皮", "逗", "俏皮", "活泼")) or \
++            any(token in lowered for token in ("playful", "teasing", "flirty")):
++        derived["social_energy"] = "playful"
++    elif any(token in combined for token in ("温柔", "轻声", "柔和", "安静", "克制")) or \
++            any(token in lowered for token in ("gentle", "soft", "quiet", "calm")):
++        derived["social_energy"] = "soft"
++    elif any(token in combined for token in ("热情", "外向", "健谈", "会主动")) or \
++            any(token in lowered for token in ("warm", "outgoing", "talkative")):
++        derived["social_energy"] = "warm"
++
++    if any(token in combined for token in ("不看新闻", "不关心时事", "别聊热点")) or \
++            any(token in lowered for token in ("doesn't follow news", "avoid current events")):
++        derived["news_attention"] = "manual_only"
++    elif any(token in combined for token in ("新闻", "时事", "热点", "资讯", "科技动态", "最新消息")) or \
++            any(token in lowered for token in ("news", "current events", "updates", "latest")):
++        derived["news_attention"] = "proactive"
++
++    if any(token in combined for token in ("不关心天气", "别提天气", "不看天气")) or \
++            any(token in lowered for token in ("ignore weather", "don't mention weather")):
++        derived["weather_attention"] = "off"
++    elif any(token in combined for token in ("天气", "降温", "下雨", "带伞", "穿衣", "出门")) or \
++            any(token in lowered for token in ("weather", "rain", "umbrella", "forecast", "temperature")):
++        derived["weather_attention"] = "contextual"
++
++    if any(token in combined for token in ("不要提醒", "别催", "不督促")) or \
++            any(token in lowered for token in ("don't remind", "avoid reminders")):
++        derived["reminder_attention"] = "off"
++    elif any(token in combined for token in ("提醒", "记得", "照顾", "日程", "计划", "生日", "纪念日")) or \
++            any(token in lowered for token in ("remind", "schedule", "remember", "anniversary", "birthday")):
++        derived["reminder_attention"] = "gentle"
++
++    if any(token in combined for token in ("不建议地方", "不管附近", "不关心地点")) or \
++            any(token in lowered for token in ("avoid location suggestions", "don't suggest places")):
++        derived["nearby_attention"] = "off"
++    elif any(token in combined for token in ("附近", "去哪", "咖啡店", "餐厅", "约会", "散步")) or \
++            any(token in lowered for token in ("nearby", "restaurant", "cafe", "date spot", "walk")):
++        derived["nearby_attention"] = "helpful"
++
++    if any(token in combined for token in ("轻声", "温柔", "低声", "耳语")) or \
++            any(token in lowered for token in ("soft voice", "gentle voice", "whisper")):
++        derived["voice_style"] = "soft"
++    elif any(token in combined for token in ("稳重", "平稳", "冷静", "不夸张")) or \
++            any(token in lowered for token in ("steady", "grounded", "measured")):
++        derived["voice_style"] = "steady"
++
++    interest_topics: list[str] = []
++    for topic, hints in _PRESENCE_TOPIC_HINTS.items():
++        if any(hint in combined for hint in hints) or any(hint in lowered for hint in hints):
++            interest_topics.append(topic)
++    if interest_topics:
++        derived["interest_topics"] = interest_topics[:6]
++
++    return derived
++
++
++def _resolve_role_asset_paths(
++    *,
++    source_dir: Path | None = None,
++    soul_path: Path | None = None,
++    user_path: Path | None = None,
++    memory_path: Path | None = None,
++    presence_path: Path | None = None,
++    skills_dir: Path | None = None,
++) -> dict[str, Path]:
++    resolved: dict[str, Path] = {}
++    if source_dir:
++        source_dir = source_dir.expanduser().resolve()
++        if not source_dir.is_dir():
++            raise FileNotFoundError(source_dir)
++        maybe = {
++            "soul": source_dir / _ROLE_ASSET_FILENAMES["soul"],
++            "user": source_dir / "memories" / _ROLE_ASSET_FILENAMES["user"],
++            "memory": source_dir / "memories" / _ROLE_ASSET_FILENAMES["memory"],
++            "presence": source_dir / _ROLE_ASSET_FILENAMES["presence"],
++            "skills": source_dir / "skills",
++        }
++        for key, path in maybe.items():
++            if path.exists():
++                resolved[key] = path
++
++    explicit = {
++        "soul": soul_path,
++        "user": user_path,
++        "memory": memory_path,
++        "presence": presence_path,
++        "skills": skills_dir,
++    }
++    for key, path in explicit.items():
++        if path is not None:
++            resolved[key] = path.expanduser().resolve()
++
++    return resolved
++
++
++def _ensure_role_files(profile_dir: Path) -> None:
++    """Ensure a role profile has the minimum file/layout expected by Hermes."""
++    profile_dir.mkdir(parents=True, exist_ok=True)
++    for subdir in _PROFILE_DIRS:
++        (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
++
++    soul_path = profile_dir / "SOUL.md"
++    if not soul_path.exists():
++        try:
++            from hermes_cli.default_soul import DEFAULT_SOUL_MD
++            soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
++        except Exception:
++            pass
++
++    config_path = profile_dir / "config.yaml"
++    try:
++        import yaml
++
++        config_changed = False
++        config_data = {}
++        if config_path.exists():
++            config_data = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
++            if not isinstance(config_data, dict):
++                config_data = {}
++        else:
++            config_changed = True
++
++        default_home = _get_default_hermes_home()
++        is_named_profile = profile_dir.resolve() != default_home.resolve()
++        default_config_path = default_home / "config.yaml"
++        if is_named_profile and default_config_path.exists():
++            default_config = yaml.safe_load(default_config_path.read_text(encoding="utf-8")) or {}
++            if isinstance(default_config, dict):
++                if _merge_missing_dict_values(config_data, default_config):
++                    config_changed = True
++
++        display = config_data.get("display")
++        if not isinstance(display, dict):
++            display = {}
++            config_data["display"] = display
++            config_changed = True
++        role_display_defaults = {
++            "user_facing_zero_trace": True,
++            "tool_progress": "off",
++            "interim_assistant_messages": False,
++            "tool_progress_command": False,
++        }
++        for key, value in role_display_defaults.items():
++            if display.get(key) != value:
++                display[key] = value
++                config_changed = True
++
++        if config_changed:
++            config_path.write_text(
++                yaml.safe_dump(config_data, sort_keys=False, allow_unicode=True),
++                encoding="utf-8",
++            )
++
++        if is_named_profile:
++            for filename in _ROLE_RUNTIME_CONFIG_FILES:
++                source = default_home / filename
++                destination = profile_dir / filename
++                if source.exists() and not destination.exists():
++                    shutil.copy2(source, destination)
++    except Exception:
++        pass
++
++    presence_path = profile_dir / "presence-config.json"
++    try:
++        from agent.presence import build_default_presence_config
++
++        role_id = profile_dir.name if profile_dir.name != ".hermes" else None
++        if not presence_path.exists():
++            presence_path.write_text(
++                json.dumps(build_default_presence_config(role_id), indent=2, ensure_ascii=False) + "\n",
++                encoding="utf-8",
++            )
++        else:
++            raw = json.loads(presence_path.read_text(encoding="utf-8"))
++            if not isinstance(raw, dict):
++                raw = {}
++            merged = {**build_default_presence_config(role_id), **raw}
++            presence_path.write_text(
++                json.dumps(merged, indent=2, ensure_ascii=False) + "\n",
++                encoding="utf-8",
++            )
++    except Exception:
++        pass
++
++
++def apply_role_assets(
++    name: str,
++    *,
++    source_dir: Path | None = None,
++    soul_path: Path | None = None,
++    user_path: Path | None = None,
++    memory_path: Path | None = None,
++    presence_path: Path | None = None,
++    skills_dir: Path | None = None,
++    reset: bool = False,
++) -> dict:
++    """Apply role assets into an isolated role profile.
++
++    Supports either a role bundle directory or explicit per-file paths.
++    Optionally resets the target role first to guarantee a clean baseline.
++    """
++    validate_profile_name(name)
++    if name == "default":
++        raise ValueError("The default profile cannot be managed as a role.")
++
++    asset_paths = _resolve_role_asset_paths(
++        source_dir=source_dir,
++        soul_path=soul_path,
++        user_path=user_path,
++        memory_path=memory_path,
++        presence_path=presence_path,
++        skills_dir=skills_dir,
++    )
++    if not asset_paths:
++        raise ValueError("No role assets provided. Use --source or explicit asset paths.")
++
++    if reset:
++        profile_dir, manifest = reset_role_profile(name)
++    else:
++        profile_dir, manifest, _ = prepare_role_profile(name)
++
++    written: dict[str, str] = {}
++    soul_text = asset_paths["soul"].read_text(encoding="utf-8") if "soul" in asset_paths else ""
++    user_text = asset_paths["user"].read_text(encoding="utf-8") if "user" in asset_paths else ""
++    memory_text = asset_paths["memory"].read_text(encoding="utf-8") if "memory" in asset_paths else ""
++
++    if "soul" in asset_paths:
++        target = profile_dir / "SOUL.md"
++        target.write_text(soul_text, encoding="utf-8")
++        written["soul"] = str(target)
++
++    if "user" in asset_paths:
++        target = profile_dir / "memories" / "USER.md"
++        target.write_text(user_text, encoding="utf-8")
++        written["user"] = str(target)
++
++    if "memory" in asset_paths:
++        target = profile_dir / "memories" / "MEMORY.md"
++        target.write_text(memory_text, encoding="utf-8")
++        written["memory"] = str(target)
++
++    from agent.presence import build_default_presence_config
++
++    derived_presence = _derive_presence_config_from_assets(
++        name,
++        soul_text=soul_text,
++        user_text=user_text,
++        memory_text=memory_text,
++    )
++    explicit_presence: dict | None = None
++    if "presence" in asset_paths:
++        source_payload = json.loads(asset_paths["presence"].read_text(encoding="utf-8"))
++        if not isinstance(source_payload, dict):
++            raise ValueError("presence-config.json must contain a JSON object.")
++        explicit_presence = source_payload
++
++    if any((soul_text, user_text, memory_text)) or explicit_presence is not None:
++        merged_presence = {**build_default_presence_config(name), **derived_presence, **(explicit_presence or {})}
++        target = profile_dir / "presence-config.json"
++        target.write_text(
++            json.dumps(merged_presence, indent=2, ensure_ascii=False) + "\n",
++            encoding="utf-8",
++        )
++        written["presence"] = str(target)
++
++    if "skills" in asset_paths:
++        source_skills = asset_paths["skills"]
++        if not source_skills.is_dir():
++            raise FileNotFoundError(source_skills)
++        target_skills = profile_dir / "skills"
++        _remove_path(target_skills)
++        target_skills.mkdir(parents=True, exist_ok=True)
++        for child in sorted(source_skills.iterdir()):
++            dest = target_skills / child.name
++            if child.is_dir():
++                shutil.copytree(child, dest)
++            elif child.is_file():
++                shutil.copy2(child, dest)
++        written["skills"] = str(target_skills)
++        _remove_path(profile_dir / ".skills_prompt_snapshot.json")
++
++    return {
++        "profile_dir": str(profile_dir),
++        "manifest": manifest,
++        "written": written,
++        "reset": reset,
++    }
++
++
++def prepare_role_profile(name: str) -> tuple[Path, dict, bool]:
++    """Create or repair a role-backed profile without clearing existing data."""
++    validate_profile_name(name)
++    if name == "default":
++        raise ValueError("The default profile cannot be managed as a role.")
++
++    created = False
++    if not profile_exists(name):
++        create_profile(name, no_alias=True)
++        created = True
++
++    profile_dir = get_profile_dir(name)
++    _ensure_role_files(profile_dir)
++
++    existing = load_role_manifest(name) or {}
++    generation = existing.get("generation", 1)
++    try:
++        generation = max(1, int(generation))
++    except (TypeError, ValueError):
++        generation = 1
++
++    manifest = build_role_manifest(
++        name,
++        generation=generation,
++        last_reset_at=existing.get("last_reset_at"),
++    )
++
++    try:
++        from plugins.memory.honcho.cli import ensure_role_honcho_config
++
++        honcho_state = ensure_role_honcho_config(name, generation=generation)
++        manifest.update({
++            "honcho_host": honcho_state["host"],
++            "honcho_workspace": honcho_state["workspace"],
++            "honcho_ai_peer": honcho_state["ai_peer"],
++            "honcho_user_peer": honcho_state["user_peer"],
++        })
++    except Exception:
++        pass
++
++    save_role_manifest(name, manifest)
++    return profile_dir, manifest, created
++
++
++def reset_role_profile(name: str) -> tuple[Path, dict]:
++    """Rebuild a role profile to a clean local baseline and advance Honcho generation."""
++    validate_profile_name(name)
++    if name == "default":
++        raise ValueError("The default profile cannot be managed as a role.")
++
++    prior_manifest = load_role_manifest(name)
++    profile_dir, existing_manifest, created = prepare_role_profile(name)
++    if not created:
++        try:
++            _stop_gateway_process(profile_dir)
++        except Exception:
++            pass
++
++    _remove_path(profile_dir / "skills")
++    _remove_path(profile_dir / "sessions")
++    _remove_path(profile_dir / "memories")
++    _remove_path(profile_dir / "logs")
++    _remove_path(profile_dir / ".skills_prompt_snapshot.json")
++
++    for rel in _ROLE_RUNTIME_GLOBS:
++        _remove_path(profile_dir / rel)
++
++    _ensure_role_files(profile_dir)
++
++    if prior_manifest is None:
++        generation = 1
++    else:
++        generation = prior_manifest.get("generation", 1)
++        try:
++            generation = int(generation) + 1
++        except (TypeError, ValueError):
++            generation = 1
++
++    manifest = build_role_manifest(
++        name,
++        generation=max(1, generation),
++        last_reset_at=_role_now(),
++    )
++
++    try:
++        from plugins.memory.honcho.cli import ensure_role_honcho_config
++
++        honcho_state = ensure_role_honcho_config(name, generation=manifest["generation"])
++        manifest.update({
++            "honcho_host": honcho_state["host"],
++            "honcho_workspace": honcho_state["workspace"],
++            "honcho_ai_peer": honcho_state["ai_peer"],
++            "honcho_user_peer": honcho_state["user_peer"],
++        })
++    except Exception:
++        pass
++
++    save_role_manifest(name, manifest)
++    return profile_dir, manifest
++
++
++def inspect_role_profile(name: str) -> dict:
++    """Return the current isolation state for a role-backed profile."""
++    validate_profile_name(name)
++    if name == "default":
++        raise ValueError("The default profile cannot be managed as a role.")
++
++    profile_dir = get_profile_dir(name)
++    exists = profile_dir.is_dir()
++    manifest = load_role_manifest(name)
++    if not manifest:
++        manifest = build_role_manifest(name)
++
++    return {
++        "role_id": name,
++        "profile_exists": exists,
++        "profile_dir": str(profile_dir),
++        "manifest_path": str(get_role_manifest_path(name)),
++        "presence_config_path": str(profile_dir / "presence-config.json"),
++        "manifest": manifest,
++        "has_soul": (profile_dir / "SOUL.md").exists(),
++        "has_user_memory": (profile_dir / "memories" / "USER.md").exists(),
++        "has_long_memory": (profile_dir / "memories" / "MEMORY.md").exists(),
++        "has_presence_config": (profile_dir / "presence-config.json").exists(),
++        "skills_count": _count_skills(profile_dir) if exists else 0,
++        "session_files": len(list((profile_dir / "sessions").glob("*"))) if (profile_dir / "sessions").exists() else 0,
++        "skills_snapshot": (profile_dir / ".skills_prompt_snapshot.json").exists(),
++        "gateway_running": _check_gateway_running(profile_dir) if exists else False,
++    }
++
++
+ # ---------------------------------------------------------------------------
+ # Alias / wrapper script management
+ # ---------------------------------------------------------------------------
+diff --git a/hermes_cli/runtime_provider.py b/hermes_cli/runtime_provider.py
+index b2dec61c..4ccbc045 100644
+--- a/hermes_cli/runtime_provider.py
++++ b/hermes_cli/runtime_provider.py
+@@ -541,7 +541,7 @@ def _resolve_explicit_runtime(
+             if not api_key:
+                 raise AuthError(
+                     "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
+-                    "run 'claude setup-token', or authenticate with 'claude /login'."
++                    "or reauthenticate with 'hermes auth reset anthropic' and 'claude setup-token'."
+                 )
+         return {
+             "provider": "anthropic",
+@@ -817,7 +817,7 @@ def resolve_runtime_provider(
+         if not token:
+             raise AuthError(
+                 "No Anthropic credentials found. Set ANTHROPIC_TOKEN or ANTHROPIC_API_KEY, "
+-                "run 'claude setup-token', or authenticate with 'claude /login'."
++                "or reauthenticate with 'hermes auth reset anthropic' and 'claude setup-token'."
+             )
+         # Allow base URL override from config.yaml model.base_url, but only
+         # when the configured provider is anthropic — otherwise a non-Anthropic
+diff --git a/plugins/memory/honcho/__init__.py b/plugins/memory/honcho/__init__.py
+index 869fe788..4bd3f09d 100644
+--- a/plugins/memory/honcho/__init__.py
++++ b/plugins/memory/honcho/__init__.py
+@@ -68,8 +68,9 @@ SEARCH_SCHEMA = {
+ CONTEXT_SCHEMA = {
+     "name": "honcho_context",
+     "description": (
+-        "Ask Honcho a natural language question and get a synthesized answer. "
+-        "Uses Honcho's LLM (dialectic reasoning) — higher cost than honcho_profile or honcho_search. "
++        "Ask Honcho a natural language question and get a synthesized answer plus structured guidance. "
++        "Uses Hermes's current main model for dialectic reasoning on top of Honcho memory context — "
++        "higher cost than honcho_profile or honcho_search. "
+         "Can query about any peer: the user (default) or the AI assistant."
+     ),
+     "parameters": {
+@@ -124,6 +125,7 @@ class HonchoMemoryProvider(MemoryProvider):
+         self._config = None    # HonchoClientConfig
+         self._session_key = ""
+         self._prefetch_result = ""
++        self._main_runtime: Dict[str, Any] = {}
+         self._prefetch_lock = threading.Lock()
+         self._prefetch_thread: Optional[threading.Thread] = None
+         self._sync_thread: Optional[threading.Thread] = None
+@@ -217,6 +219,8 @@ class HonchoMemoryProvider(MemoryProvider):
+                 logger.debug("Honcho not configured — plugin inactive")
+                 return
+ 
++            self._main_runtime = dict(kwargs.get("main_runtime") or {})
++
+             # Override peer_name with gateway user_id for per-user memory scoping.
+             # Only when no explicit peerName was configured — an explicit peerName
+             # means the user chose their identity; a raw user_id (e.g. Telegram
+@@ -283,6 +287,7 @@ class HonchoMemoryProvider(MemoryProvider):
+             honcho=client,
+             config=cfg,
+             context_tokens=cfg.context_tokens,
++            main_runtime=self._main_runtime,
+         )
+ 
+         # ----- B3: resolve_session_name -----
+@@ -367,6 +372,17 @@ class HonchoMemoryProvider(MemoryProvider):
+             return ""
+         return "\n\n".join(parts)
+ 
++    @staticmethod
++    def _format_dialectic_analysis(analysis: dict) -> tuple[str, dict]:
++        """Normalize structured dialectic output for prompts and tools."""
++        from plugins.memory.honcho.session import HermesDialecticAnalysis
++
++        normalized = HermesDialecticAnalysis.from_payload(
++            analysis,
++            fallback_reason="Hermes dialectic analysis returned no payload.",
++        )
++        return normalized.to_prompt_block(), normalized.to_dict()
++
+     def system_prompt_block(self) -> str:
+         """Return system prompt text, adapted by recall_mode.
+ 
+@@ -499,9 +515,10 @@ class HonchoMemoryProvider(MemoryProvider):
+ 
+         def _run():
+             try:
+-                result = self._manager.dialectic_query(
++                analysis = self._manager.dialectic_analysis(
+                     self._session_key, query, peer="user"
+                 )
++                result, _ = self._format_dialectic_analysis(analysis)
+                 if result and result.strip():
+                     with self._prefetch_lock:
+                         self._prefetch_result = result
+@@ -524,6 +541,11 @@ class HonchoMemoryProvider(MemoryProvider):
+     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
+         """Track turn count for cadence and injection_frequency logic."""
+         self._turn_count = turn_number
++        runtime = kwargs.get("main_runtime")
++        if runtime:
++            self._main_runtime = dict(runtime)
++            if self._manager:
++                self._manager.set_main_runtime(runtime)
+ 
+     @staticmethod
+     def _chunk_message(content: str, limit: int) -> list[str]:
+@@ -681,10 +703,14 @@ class HonchoMemoryProvider(MemoryProvider):
+                 if not query:
+                     return tool_error("Missing required parameter: query")
+                 peer = args.get("peer", "user")
+-                result = self._manager.dialectic_query(
++                analysis = self._manager.dialectic_analysis(
+                     self._session_key, query, peer=peer
+                 )
+-                return json.dumps({"result": result or "No result from Honcho."})
++                result, payload = self._format_dialectic_analysis(analysis)
++                return json.dumps({
++                    "result": result or "No result from Honcho.",
++                    "analysis": payload,
++                })
+ 
+             elif tool_name == "honcho_conclude":
+                 conclusion = args.get("conclusion", "")
+diff --git a/plugins/memory/honcho/cli.py b/plugins/memory/honcho/cli.py
+index dff4b386..b7d030ce 100644
+--- a/plugins/memory/honcho/cli.py
++++ b/plugins/memory/honcho/cli.py
+@@ -8,6 +8,7 @@ from __future__ import annotations
+ import json
+ import os
+ import sys
++from copy import deepcopy
+ from pathlib import Path
+ 
+ from hermes_constants import get_hermes_home
+@@ -70,6 +71,104 @@ def clone_honcho_for_profile(profile_name: str) -> bool:
+     return True
+ 
+ 
++def _default_honcho_config_path() -> Path:
++    """Return the shared default-profile Honcho config path."""
++    try:
++        from hermes_cli.profiles import _get_default_hermes_home
++
++        return _get_default_hermes_home() / "honcho.json"
++    except Exception:
++        return Path.home() / ".hermes" / "honcho.json"
++
++
++def _read_shared_config() -> dict:
++    """Read the shared Honcho config, preferring ~/.hermes/honcho.json."""
++    shared_path = _default_honcho_config_path()
++    if shared_path.exists():
++        try:
++            return json.loads(shared_path.read_text(encoding="utf-8"))
++        except Exception:
++            pass
++    return _read_config()
++
++
++def _identity_enabled(default_block: dict, cfg: dict) -> bool:
++    root_enabled = cfg.get("enabled")
++    host_enabled = default_block.get("enabled")
++    if host_enabled is not None:
++        return bool(host_enabled)
++    if root_enabled is not None:
++        return bool(root_enabled)
++    return bool(
++        cfg.get("apiKey")
++        or cfg.get("baseUrl")
++        or cfg.get("base_url")
++        or os.environ.get("HONCHO_API_KEY")
++        or os.environ.get("HONCHO_BASE_URL")
++    )
++
++
++def _role_identity(profile_name: str, generation: int) -> dict[str, str]:
++    return {
++        "host": f"{HOST}.{profile_name}",
++        "workspace": f"hermes-role-{profile_name}-g{generation}",
++        "ai_peer": profile_name,
++        "user_peer": f"user-{profile_name}",
++    }
++
++
++def ensure_role_honcho_config(profile_name: str, generation: int = 1) -> dict[str, str]:
++    """Ensure a role-backed Honcho host block exists with isolated identity."""
++    if generation < 1:
++        raise ValueError("Role Honcho generation must be >= 1.")
++
++    cfg = _read_shared_config()
++    hosts = cfg.setdefault("hosts", {})
++    default_block = hosts.get(HOST, {})
++    identity = _role_identity(profile_name, generation)
++    host_key = identity["host"]
++
++    role_block = deepcopy(hosts.get(host_key, {}))
++    for key in (
++        "recallMode",
++        "writeFrequency",
++        "sessionStrategy",
++        "sessionPeerPrefix",
++        "contextTokens",
++        "dialecticReasoningLevel",
++        "dialecticDynamic",
++        "dialecticMaxChars",
++        "messageMaxChars",
++        "dialecticMaxInputChars",
++        "saveMessages",
++        "observation",
++        "observationMode",
++    ):
++        if key in role_block:
++            continue
++        value = default_block.get(key)
++        if value is None:
++            value = cfg.get(key)
++        if value is not None:
++            role_block[key] = deepcopy(value)
++
++    role_block["enabled"] = _identity_enabled(default_block, cfg)
++    role_block["peerName"] = identity["user_peer"]
++    role_block["aiPeer"] = identity["ai_peer"]
++    role_block["workspace"] = identity["workspace"]
++    hosts[host_key] = role_block
++
++    write_path = _default_honcho_config_path()
++    _write_config(cfg, path=write_path)
++
++    try:
++        _ensure_peer_exists(host_key)
++    except Exception:
++        pass
++
++    return identity
++
++
+ def _ensure_peer_exists(host_key: str | None = None) -> bool:
+     """Create the AI peer in Honcho if it doesn't already exist.
+ 
+diff --git a/plugins/memory/honcho/client.py b/plugins/memory/honcho/client.py
+index 3c779f64..cf539019 100644
+--- a/plugins/memory/honcho/client.py
++++ b/plugins/memory/honcho/client.py
+@@ -553,6 +553,17 @@ def get_honcho_client(config: HonchoClientConfig | None = None) -> Honcho:
+     }
+     if resolved_base_url:
+         kwargs["base_url"] = resolved_base_url
++    if _is_local:
++        try:
++            import httpx
++
++            kwargs["http_client"] = httpx.Client(
++                base_url=resolved_base_url,
++                timeout=httpx.Timeout(30.0),
++                trust_env=False,
++            )
++        except Exception as e:
++            logger.debug("Failed to build proxy-free local Honcho client: %s", e)
+ 
+     _honcho_client = Honcho(**kwargs)
+ 
+diff --git a/plugins/memory/honcho/session.py b/plugins/memory/honcho/session.py
+index 2cd4c5bd..bee3226d 100644
+--- a/plugins/memory/honcho/session.py
++++ b/plugins/memory/honcho/session.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import queue
+ import re
+ import logging
+@@ -65,6 +66,104 @@ class HonchoSession:
+         self.updated_at = datetime.now()
+ 
+ 
++@dataclass
++class HermesDialecticAnalysis:
++    """Structured Honcho analysis produced by Hermes's main model."""
++
++    need_state: str = "steady"
++    emotional_tone: str = "neutral"
++    initiative_hint: str = "Use remembered context gently and do not force a topic."
++    topic_suggestions: list[str] = field(default_factory=list)
++    confidence: float = 0.0
++    reasoning_summary: str = ""
++
++    def to_dict(self) -> dict[str, Any]:
++        return {
++            "need_state": self.need_state,
++            "emotional_tone": self.emotional_tone,
++            "initiative_hint": self.initiative_hint,
++            "topic_suggestions": list(self.topic_suggestions),
++            "confidence": float(self.confidence),
++            "reasoning_summary": self.reasoning_summary,
++        }
++
++    def to_prompt_block(self) -> str:
++        lines = [
++            f"- Need state: {self.need_state}",
++            f"- Emotional tone: {self.emotional_tone}",
++            f"- Initiative hint: {self.initiative_hint}",
++        ]
++        if self.topic_suggestions:
++            lines.append("- Topic suggestions:")
++            lines.extend([f"  - {item}" for item in self.topic_suggestions[:3]])
++        lines.append(f"- Confidence: {self.confidence:.2f}")
++        if self.reasoning_summary:
++            lines.append(f"- Reasoning summary: {self.reasoning_summary}")
++        return "\n".join(lines)
++
++    def to_tool_result(self) -> str:
++        parts = [
++            f"need_state: {self.need_state}",
++            f"emotional_tone: {self.emotional_tone}",
++            f"initiative_hint: {self.initiative_hint}",
++        ]
++        if self.topic_suggestions:
++            parts.append("topic_suggestions: " + "; ".join(self.topic_suggestions[:3]))
++        parts.append(f"confidence: {self.confidence:.2f}")
++        if self.reasoning_summary:
++            parts.append(f"reasoning_summary: {self.reasoning_summary}")
++        return "\n".join(parts)
++
++    @classmethod
++    def fallback(cls, reason: str, *, topics: list[str] | None = None) -> "HermesDialecticAnalysis":
++        return cls(
++            need_state="steady",
++            emotional_tone="neutral",
++            initiative_hint="Use the available memory softly; do not over-assert.",
++            topic_suggestions=topics or [],
++            confidence=0.15,
++            reasoning_summary=reason,
++        )
++
++    @classmethod
++    def from_payload(
++        cls,
++        payload: dict[str, Any] | None,
++        *,
++        fallback_reason: str = "",
++        fallback_topics: list[str] | None = None,
++    ) -> "HermesDialecticAnalysis":
++        if not isinstance(payload, dict):
++            return cls.fallback(fallback_reason or "Invalid dialectic payload.", topics=fallback_topics)
++
++        topics = payload.get("topic_suggestions", [])
++        if isinstance(topics, str):
++            topics = [item.strip() for item in topics.split(";") if item.strip()]
++        elif isinstance(topics, list):
++            topics = [str(item).strip() for item in topics if str(item).strip()]
++        else:
++            topics = []
++
++        try:
++            confidence = float(payload.get("confidence", 0.0))
++        except (TypeError, ValueError):
++            confidence = 0.0
++
++        analysis = cls(
++            need_state=str(payload.get("need_state") or "steady").strip() or "steady",
++            emotional_tone=str(payload.get("emotional_tone") or "neutral").strip() or "neutral",
++            initiative_hint=str(payload.get("initiative_hint") or "Use remembered context gently and do not force a topic.").strip(),
++            topic_suggestions=topics[:3],
++            confidence=max(0.0, min(confidence, 1.0)),
++            reasoning_summary=str(payload.get("reasoning_summary") or fallback_reason or "").strip(),
++        )
++        if not analysis.reasoning_summary and fallback_reason:
++            analysis.reasoning_summary = fallback_reason
++        if not analysis.topic_suggestions and fallback_topics:
++            analysis.topic_suggestions = fallback_topics[:3]
++        return analysis
++
++
+ class HonchoSessionManager:
+     """
+     Manages conversation sessions using Honcho.
+@@ -78,6 +177,7 @@ class HonchoSessionManager:
+         honcho: Honcho | None = None,
+         context_tokens: int | None = None,
+         config: Any | None = None,
++        main_runtime: dict[str, Any] | None = None,
+     ):
+         """
+         Initialize the session manager.
+@@ -94,6 +194,7 @@ class HonchoSessionManager:
+         self._cache: dict[str, HonchoSession] = {}
+         self._peers_cache: dict[str, Any] = {}
+         self._sessions_cache: dict[str, Any] = {}
++        self._main_runtime = self._normalize_main_runtime(main_runtime)
+ 
+         # Write frequency state
+         write_frequency = (config.write_frequency if config else "async")
+@@ -102,7 +203,7 @@ class HonchoSessionManager:
+ 
+         # Prefetch caches: session_key → last result (consumed once per turn)
+         self._context_cache: dict[str, dict] = {}
+-        self._dialectic_cache: dict[str, str] = {}
++        self._dialectic_cache: dict[str, dict[str, Any]] = {}
+         self._prefetch_cache_lock = threading.Lock()
+         self._dialectic_reasoning_level: str = (
+             config.dialectic_reasoning_level if config else "low"
+@@ -140,6 +241,65 @@ class HonchoSessionManager:
+             )
+             self._async_thread.start()
+ 
++    @staticmethod
++    def _normalize_main_runtime(main_runtime: dict[str, Any] | None) -> dict[str, str]:
++        fields = ("provider", "model", "base_url", "api_key", "api_mode")
++        runtime: dict[str, str] = {}
++        if not isinstance(main_runtime, dict):
++            return runtime
++        for field in fields:
++            value = main_runtime.get(field)
++            runtime[field] = value.strip() if isinstance(value, str) else (str(value).strip() if value is not None else "")
++        return runtime
++
++    def set_main_runtime(self, main_runtime: dict[str, Any] | None) -> None:
++        """Update the runtime config used for Hermes-backed dialectic calls."""
++        runtime = self._normalize_main_runtime(main_runtime)
++        if runtime:
++            self._main_runtime = runtime
++
++    def _resolve_main_runtime(self) -> dict[str, str]:
++        """Resolve Hermes's live main runtime without duplicating provider logic."""
++        if self._main_runtime.get("provider") and self._main_runtime.get("model"):
++            return dict(self._main_runtime)
++        try:
++            from hermes_cli.config import load_config
++            from hermes_cli.runtime_provider import resolve_runtime_provider
++
++            cfg = load_config()
++            model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
++            requested = model_cfg.get("provider")
++            runtime = resolve_runtime_provider(requested=requested)
++            merged = {
++                "provider": str(runtime.get("provider") or requested or "auto").strip(),
++                "model": str(model_cfg.get("default") or model_cfg.get("model") or "").strip(),
++                "base_url": str(runtime.get("base_url") or "").strip(),
++                "api_key": str(runtime.get("api_key") or "").strip(),
++                "api_mode": str(runtime.get("api_mode") or "").strip(),
++            }
++            self._main_runtime = self._normalize_main_runtime(merged)
++        except Exception as e:
++            logger.warning("Honcho Hermes runtime resolution failed: %s", e)
++        return dict(self._main_runtime)
++
++    @staticmethod
++    def _extract_json_object(text: str) -> dict[str, Any] | None:
++        cleaned = text.strip()
++        if cleaned.startswith("```"):
++            cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
++            cleaned = re.sub(r"\s*```$", "", cleaned)
++        decoder = json.JSONDecoder()
++        for idx, char in enumerate(cleaned):
++            if char != "{":
++                continue
++            try:
++                payload, _ = decoder.raw_decode(cleaned[idx:])
++                if isinstance(payload, dict):
++                    return payload
++            except json.JSONDecodeError:
++                continue
++        return None
++
+     @property
+     def honcho(self) -> Honcho:
+         """Get the Honcho client, initializing if needed."""
+@@ -517,6 +677,120 @@ class HonchoSessionManager:
+         idx = min(default_idx + bump, 3)
+         return levels[idx]
+ 
++    @staticmethod
++    def _reasoning_level_to_effort(level: str) -> str:
++        mapping = {
++            "minimal": "low",
++            "low": "low",
++            "medium": "medium",
++            "high": "high",
++            "max": "high",
++        }
++        return mapping.get(level, "medium")
++
++    def _build_dialectic_payload(
++        self,
++        session: HonchoSession,
++        query: str,
++        peer: str,
++        reasoning_level: str,
++    ) -> dict[str, Any]:
++        user_ctx = self._fetch_peer_context(session.user_peer_id, search_query=query)
++        ai_ctx = self._fetch_peer_context(session.assistant_peer_id, search_query=query if peer == "ai" else None)
++        recent_history = session.get_history(max_messages=8)
++        return {
++            "query": query,
++            "peer": peer,
++            "reasoning_level": reasoning_level,
++            "user_representation": user_ctx.get("representation", ""),
++            "user_card": user_ctx.get("card", []),
++            "ai_representation": ai_ctx.get("representation", ""),
++            "ai_card": ai_ctx.get("card", []),
++            "recent_history": recent_history,
++        }
++
++    def _run_hermes_dialectic(
++        self,
++        payload: dict[str, Any],
++        *,
++        reasoning_level: str,
++    ) -> HermesDialecticAnalysis:
++        runtime = self._resolve_main_runtime()
++        topic_fallbacks = [str(item).strip() for item in payload.get("user_card", [])[:2] if str(item).strip()]
++        if not runtime.get("provider") or not runtime.get("model"):
++            return HermesDialecticAnalysis.fallback(
++                "Hermes runtime is unavailable for Honcho dialectic.",
++                topics=topic_fallbacks,
++            )
++
++        prompt = json.dumps(payload, ensure_ascii=False, indent=2)
++        messages = [
++            {
++                "role": "system",
++                "content": (
++                    "You are the Honcho dialectic layer inside Hermes. "
++                    "You receive Honcho memory context and must return a single JSON object only. "
++                    "Required keys: need_state, emotional_tone, initiative_hint, topic_suggestions, confidence, reasoning_summary. "
++                    "topic_suggestions must be an array of short strings. confidence must be a float between 0 and 1. "
++                    "Do not use markdown or code fences."
++                ),
++            },
++            {
++                "role": "user",
++                "content": (
++                    "Analyze the following Honcho memory payload and produce soft behavioral guidance for Hermes.\n"
++                    f"Reasoning level hint: {reasoning_level}\n\n"
++                    f"{prompt}"
++                ),
++            },
++        ]
++
++        try:
++            from agent.auxiliary_client import call_llm, extract_content_or_reasoning
++
++            response = call_llm(
++                provider="auto",
++                model=runtime.get("model") or None,
++                main_runtime=runtime,
++                messages=messages,
++                temperature=0.2,
++                max_tokens=700,
++                timeout=60,
++                extra_body={"reasoning_effort": self._reasoning_level_to_effort(reasoning_level)},
++            )
++            content = extract_content_or_reasoning(response)
++            payload = self._extract_json_object(content or "")
++            return HermesDialecticAnalysis.from_payload(
++                payload,
++                fallback_reason="Hermes returned a non-JSON dialectic payload.",
++                fallback_topics=topic_fallbacks,
++            )
++        except Exception as e:
++            logger.warning("Honcho Hermes dialectic call failed: %s", e)
++            return HermesDialecticAnalysis.fallback(
++                f"Hermes dialectic call failed: {e}",
++                topics=topic_fallbacks,
++            )
++
++    def dialectic_analysis(
++        self,
++        session_key: str,
++        query: str,
++        reasoning_level: str | None = None,
++        peer: str = "user",
++    ) -> dict[str, Any]:
++        """Analyze Honcho context using Hermes's live main model."""
++        session = self._cache.get(session_key)
++        if not session:
++            return HermesDialecticAnalysis.fallback("No Honcho session available.").to_dict()
++
++        if len(query) > self._dialectic_max_input_chars:
++            query = query[:self._dialectic_max_input_chars].rsplit(" ", 1)[0]
++
++        level = reasoning_level or self._dynamic_reasoning_level(query)
++        payload = self._build_dialectic_payload(session, query, peer, level)
++        return self._run_hermes_dialectic(payload, reasoning_level=level).to_dict()
++
+     def dialectic_query(
+         self, session_key: str, query: str,
+         reasoning_level: str | None = None,
+@@ -537,44 +811,21 @@ class HonchoSessionManager:
+             peer: Which peer to query — "user" (default) or "ai".
+ 
+         Returns:
+-            Honcho's synthesized answer, or empty string on failure.
++            Hermes's synthesized answer, or empty string on failure.
+         """
+-        session = self._cache.get(session_key)
+-        if not session:
+-            return ""
+-
+-        # Guard: truncate query to Honcho's dialectic input limit
+-        if len(query) > self._dialectic_max_input_chars:
+-            query = query[:self._dialectic_max_input_chars].rsplit(" ", 1)[0]
+-
+-        level = reasoning_level or self._dynamic_reasoning_level(query)
+-
+-        try:
+-            if self._ai_observe_others:
+-                # AI peer can observe user — use cross-observation routing
+-                if peer == "ai":
+-                    ai_peer_obj = self._get_or_create_peer(session.assistant_peer_id)
+-                    result = ai_peer_obj.chat(query, reasoning_level=level) or ""
+-                else:
+-                    ai_peer_obj = self._get_or_create_peer(session.assistant_peer_id)
+-                    result = ai_peer_obj.chat(
+-                        query,
+-                        target=session.user_peer_id,
+-                        reasoning_level=level,
+-                    ) or ""
+-            else:
+-                # AI can't observe others — each peer queries self
+-                peer_id = session.assistant_peer_id if peer == "ai" else session.user_peer_id
+-                target_peer = self._get_or_create_peer(peer_id)
+-                result = target_peer.chat(query, reasoning_level=level) or ""
+-
+-            # Apply Hermes-side char cap before caching
+-            if result and self._dialectic_max_chars and len(result) > self._dialectic_max_chars:
+-                result = result[:self._dialectic_max_chars].rsplit(" ", 1)[0] + " …"
+-            return result
+-        except Exception as e:
+-            logger.warning("Honcho dialectic query failed: %s", e)
+-            return ""
++        analysis = HermesDialecticAnalysis.from_payload(
++            self.dialectic_analysis(
++                session_key,
++                query,
++                reasoning_level=reasoning_level,
++                peer=peer,
++            ),
++            fallback_reason="Hermes dialectic analysis returned no payload.",
++        )
++        result = analysis.to_tool_result()
++        if result and self._dialectic_max_chars and len(result) > self._dialectic_max_chars:
++            result = result[:self._dialectic_max_chars].rsplit(" ", 1)[0] + " …"
++        return result
+ 
+     def prefetch_dialectic(self, session_key: str, query: str) -> None:
+         """
+@@ -589,28 +840,28 @@ class HonchoSessionManager:
+             query: The user's current message, used as the query.
+         """
+         def _run():
+-            result = self.dialectic_query(session_key, query)
++            result = self.dialectic_analysis(session_key, query)
+             if result:
+                 self.set_dialectic_result(session_key, result)
+ 
+         t = threading.Thread(target=_run, name="honcho-dialectic-prefetch", daemon=True)
+         t.start()
+ 
+-    def set_dialectic_result(self, session_key: str, result: str) -> None:
++    def set_dialectic_result(self, session_key: str, result: dict[str, Any]) -> None:
+         """Store a prefetched dialectic result in a thread-safe way."""
+         if not result:
+             return
+         with self._prefetch_cache_lock:
+             self._dialectic_cache[session_key] = result
+ 
+-    def pop_dialectic_result(self, session_key: str) -> str:
++    def pop_dialectic_result(self, session_key: str) -> dict[str, Any]:
+         """
+         Return and clear the cached dialectic result for this session.
+ 
+-        Returns empty string if no result is ready yet.
++        Returns empty dict if no result is ready yet.
+         """
+         with self._prefetch_cache_lock:
+-            return self._dialectic_cache.pop(session_key, "")
++            return self._dialectic_cache.pop(session_key, {})
+ 
+     def prefetch_context(self, session_key: str, user_message: str | None = None) -> None:
+         """
+diff --git a/run_agent.py b/run_agent.py
+index efaeba82..d69b7e5e 100644
+--- a/run_agent.py
++++ b/run_agent.py
+@@ -92,9 +92,10 @@ from agent.model_metadata import (
+     query_ollama_num_ctx,
+ )
+ from agent.context_compressor import ContextCompressor
++from agent.presence import PresenceManager
+ from agent.subdirectory_hints import SubdirectoryHintTracker
+ from agent.prompt_caching import apply_anthropic_cache_control
+-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
++from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, is_role_profile, ROLE_PROFILE_BEHAVIOR_GUIDANCE, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+ from agent.usage_pricing import estimate_usage_cost, normalize_usage
+ from agent.display import (
+     KawaiiSpinner, build_tool_preview as _build_tool_preview,
+@@ -670,6 +671,7 @@ class AIAgent:
+         self._credential_pool = credential_pool
+         self.log_prefix_chars = log_prefix_chars
+         self.log_prefix = f"{log_prefix} " if log_prefix else ""
++        self._presence_manager = PresenceManager(get_hermes_home())
+         # Store effective base URL for feature detection (prompt caching, reasoning, etc.)
+         self.base_url = base_url or ""
+         provider_name = provider.strip().lower() if isinstance(provider, str) and provider.strip() else None
+@@ -1202,6 +1204,7 @@ class AIAgent:
+                             "platform": platform or "cli",
+                             "hermes_home": str(_ghh()),
+                             "agent_context": "primary",
++                            "main_runtime": self._current_main_runtime(),
+                         }
+                         # Thread gateway user identity for per-user memory scoping
+                         if self._user_id:
+@@ -3173,6 +3176,10 @@ class AIAgent:
+             # Fallback to hardcoded identity
+             prompt_parts = [DEFAULT_AGENT_IDENTITY]
+ 
++        _role_profile_active = is_role_profile()
++        if _role_profile_active:
++            prompt_parts.append(ROLE_PROFILE_BEHAVIOR_GUIDANCE)
++
+         # Tool-aware behavioral guidance: only inject when the tools are loaded
+         tool_guidance = []
+         if "memory" in self.valid_tool_names:
+@@ -3194,7 +3201,7 @@ class AIAgent:
+         #   true  — always inject (all models)
+         #   false — never inject
+         #   list  — custom model-name substrings to match
+-        if self.valid_tool_names:
++        if self.valid_tool_names and not _role_profile_active:
+             _enforce = self._tool_use_enforcement
+             _inject = False
+             if _enforce is True or (isinstance(_enforce, str) and _enforce.lower() in ("true", "always", "yes", "on")):
+@@ -8076,6 +8083,16 @@ class AIAgent:
+         # contribute context alongside the user's input.
+         #
+         # All injected context is ephemeral (not persisted to session DB).
++        _presence_user_context = ""
++        try:
++            _presence_user_context = self._presence_manager.build_presence_block(
++                original_user_message,
++                platform=getattr(self, "platform", None) or "",
++                user_id=getattr(self, "_user_id", None) or "",
++            )
++        except Exception as exc:
++            logger.debug("presence block build failed: %s", exc)
++
+         _plugin_user_context = ""
+         try:
+             from hermes_cli.plugins import invoke_hook as _invoke_hook
+@@ -8128,6 +8145,13 @@ class AIAgent:
+         if self._memory_manager:
+             try:
+                 _query = original_user_message if isinstance(original_user_message, str) else ""
++                self._memory_manager.on_turn_start(
++                    self._user_turn_count,
++                    _query,
++                    model=self.model,
++                    platform=getattr(self, "platform", None) or "",
++                    main_runtime=self._current_main_runtime(),
++                )
+                 _ext_prefetch_cache = self._memory_manager.prefetch_all(_query) or ""
+             except Exception:
+                 pass
+@@ -8208,6 +8232,8 @@ class AIAgent:
+                 # never mutated, so nothing leaks into session persistence.
+                 if idx == current_turn_user_idx and msg.get("role") == "user":
+                     _injections = []
++                    if _presence_user_context:
++                        _injections.append(_presence_user_context)
+                     if _ext_prefetch_cache:
+                         _fenced = build_memory_context_block(_ext_prefetch_cache)
+                         if _fenced:
+@@ -9146,7 +9172,7 @@ class AIAgent:
+                         print(f"{self.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
+                         print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
+                         print(f"{self.log_prefix}     • For API keys: verify at https://console.anthropic.com/settings/keys")
+-                        print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
++                        print(f"{self.log_prefix}     • For Claude Pro/Max OAuth: run 'hermes auth reset anthropic' then 'claude setup-token'")
+                         print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
+                         print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
+ 
+diff --git a/tests/agent/test_anthropic_adapter.py b/tests/agent/test_anthropic_adapter.py
+index ae78888d..d9234ecb 100644
+--- a/tests/agent/test_anthropic_adapter.py
++++ b/tests/agent/test_anthropic_adapter.py
+@@ -1,11 +1,15 @@
+ """Tests for agent/anthropic_adapter.py — Anthropic Messages API adapter."""
+ 
++import base64
++import hashlib
+ import json
+ import time
+ from types import SimpleNamespace
+ from unittest.mock import patch, MagicMock
+ 
+ import pytest
++from cryptography.hazmat.backends import default_backend
++from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+ 
+ from agent.prompt_caching import apply_anthropic_cache_control
+ from agent.anthropic_adapter import (
+@@ -162,6 +166,39 @@ class TestReadClaudeCodeCredentials:
+         monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
+         assert read_claude_code_credentials() is None
+ 
++    def test_falls_back_to_claude_desktop_token_cache(self, tmp_path, monkeypatch):
++        desktop_dir = tmp_path / "Library" / "Application Support" / "Claude"
++        desktop_dir.mkdir(parents=True)
++        secret = "desktop-safe-storage-secret"
++        token_payload = {
++            "desktop-cache-key:https://api.anthropic.com:user:inference user:profile": {
++                "token": "sk-ant-oat01-desktop-token",
++                "refreshToken": "sk-ant-ort01-desktop-refresh",
++                "expiresAt": int(time.time() * 1000) + 3600_000,
++            }
++        }
++        plaintext = json.dumps(token_payload).encode("utf-8")
++        pad = 16 - (len(plaintext) % 16)
++        plaintext += bytes([pad]) * pad
++        key = hashlib.pbkdf2_hmac("sha1", secret.encode(), b"saltysalt", 1003, dklen=16)
++        iv = b" " * 16
++        cipher = Cipher(algorithms.AES(key), modes.CBC(iv), backend=default_backend())
++        encryptor = cipher.encryptor()
++        encrypted = b"v10" + encryptor.update(plaintext) + encryptor.finalize()
++        (desktop_dir / "config.json").write_text(json.dumps({
++            "oauth:tokenCache": base64.b64encode(encrypted).decode("ascii"),
++        }))
++
++        monkeypatch.setattr("agent.anthropic_adapter.Path.home", lambda: tmp_path)
++        monkeypatch.setattr("agent.anthropic_adapter.os.uname", lambda: SimpleNamespace(sysname="Darwin"))
++        monkeypatch.setattr("agent.anthropic_adapter._read_claude_safe_storage_secret", lambda: secret)
++
++        creds = read_claude_code_credentials()
++        assert creds is not None
++        assert creds["accessToken"] == "sk-ant-oat01-desktop-token"
++        assert creds["refreshToken"] == "sk-ant-ort01-desktop-refresh"
++        assert creds["source"] == "claude_desktop_token_cache"
++
+ 
+ class TestIsClaudeCodeTokenValid:
+     def test_valid_token(self):
+diff --git a/tests/agent/test_credential_pool.py b/tests/agent/test_credential_pool.py
+index ca232c12..2e5eb9bf 100644
+--- a/tests/agent/test_credential_pool.py
++++ b/tests/agent/test_credential_pool.py
+@@ -252,6 +252,7 @@ def test_exhausted_402_entry_resets_after_one_hour(tmp_path, monkeypatch):
+ 
+ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatch):
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+     _write_auth_store(
+         tmp_path,
+         {
+@@ -641,6 +642,44 @@ def test_load_pool_prefers_anthropic_env_token_over_file_backed_oauth(tmp_path,
+     assert entry.access_token == "env-override-token"
+ 
+ 
++def test_load_pool_clears_exhausted_status_when_anthropic_env_token_changes(tmp_path, monkeypatch):
++    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
++    monkeypatch.setenv("ANTHROPIC_TOKEN", "fresh-env-token")
++    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
++    _write_auth_store(
++        tmp_path,
++        {
++            "version": 1,
++            "credential_pool": {
++                "anthropic": [
++                    {
++                        "id": "cred-1",
++                        "label": "ANTHROPIC_TOKEN",
++                        "auth_type": "oauth",
++                        "priority": 0,
++                        "source": "env:ANTHROPIC_TOKEN",
++                        "access_token": "stale-env-token",
++                        "last_status": "exhausted",
++                        "last_status_at": time.time(),
++                        "last_error_code": 401,
++                    }
++                ]
++            },
++        },
++    )
++
++    from agent.credential_pool import load_pool
++
++    pool = load_pool("anthropic")
++    entry = pool.select()
++
++    assert entry is not None
++    assert entry.access_token == "fresh-env-token"
++    assert entry.last_status is None
++    assert entry.last_error_code is None
++
++
+ def test_least_used_strategy_selects_lowest_count(tmp_path, monkeypatch):
+     """least_used strategy should select the credential with the lowest request_count."""
+     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+diff --git a/tests/agent/test_prompt_builder.py b/tests/agent/test_prompt_builder.py
+index 5a222cc3..3dbd3907 100644
+--- a/tests/agent/test_prompt_builder.py
++++ b/tests/agent/test_prompt_builder.py
+@@ -21,6 +21,7 @@ from agent.prompt_builder import (
+     build_environment_hints,
+     CONTEXT_FILE_MAX_CHARS,
+     DEFAULT_AGENT_IDENTITY,
++    ROLE_PROFILE_BEHAVIOR_GUIDANCE,
+     TOOL_USE_ENFORCEMENT_GUIDANCE,
+     TOOL_USE_ENFORCEMENT_MODELS,
+     OPENAI_MODEL_EXECUTION_GUIDANCE,
+@@ -28,6 +29,7 @@ from agent.prompt_builder import (
+     SESSION_SEARCH_GUIDANCE,
+     PLATFORM_HINTS,
+     WSL_ENVIRONMENT_HINT,
++    is_role_profile,
+ )
+ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
+ 
+@@ -771,6 +773,26 @@ class TestPromptBuilderConstants:
+         assert "cron" in PLATFORM_HINTS
+         assert "cli" in PLATFORM_HINTS
+ 
++    def test_role_profile_guidance_mentions_relational_mode(self):
++        assert "character profile" in ROLE_PROFILE_BEHAVIOR_GUIDANCE
++        assert "respond like a person first" in ROLE_PROFILE_BEHAVIOR_GUIDANCE
++
++
++class TestRoleProfileDetection:
++    def test_is_role_profile_false_without_manifest(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        assert is_role_profile() is False
++
++    def test_is_role_profile_true_with_manifest(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        (tmp_path / "role-manifest.json").write_text('{"role_id":"caleb"}', encoding="utf-8")
++        assert is_role_profile() is True
++
++    def test_is_role_profile_false_for_invalid_manifest(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        (tmp_path / "role-manifest.json").write_text("not json", encoding="utf-8")
++        assert is_role_profile() is False
++
+ 
+ # =========================================================================
+ # Environment hints
+@@ -1034,4 +1056,3 @@ class TestOpenAIModelExecutionGuidance:
+ # =========================================================================
+ 
+ 
+-
+diff --git a/tests/gateway/test_run_progress_topics.py b/tests/gateway/test_run_progress_topics.py
+index 1b782961..f0ab43fd 100644
+--- a/tests/gateway/test_run_progress_topics.py
++++ b/tests/gateway/test_run_progress_topics.py
+@@ -378,6 +378,28 @@ class PreviewedResponseAgent:
+         }
+ 
+ 
++class NoisyUserFacingAgent:
++    def __init__(self, **kwargs):
++        self.tool_progress_callback = kwargs.get("tool_progress_callback")
++        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
++        self.tools = []
++
++    def run_conversation(self, message, conversation_history=None, task_id=None):
++        if self.tool_progress_callback:
++            self.tool_progress_callback("tool.started", "web_search", "latest", {"query": "latest"})
++        if self.interim_assistant_callback:
++            self.interim_assistant_callback("我正在调用 web_search 查一下。", already_streamed=False)
++        if getattr(self, "status_callback", None):
++            self.status_callback("context", "💾 Memory updated")
++        if getattr(self, "background_review_callback", None):
++            self.background_review_callback("⚙️ tool call")
++        return {
++            "final_response": "我正在调用 web_search 查了一下。\n你那边今天会下雨，记得带伞。",
++            "messages": [],
++            "api_calls": 1,
++        }
++
++
+ class StreamingRefineAgent:
+     def __init__(self, **kwargs):
+         self.stream_delta_callback = kwargs.get("stream_delta_callback")
+@@ -626,6 +648,26 @@ async def test_run_agent_previewed_final_marks_already_sent(monkeypatch, tmp_pat
+     assert [call["content"] for call in adapter.sent] == ["You're welcome."]
+ 
+ 
++@pytest.mark.asyncio
++async def test_run_agent_zero_trace_suppresses_gateway_tool_artifacts(monkeypatch, tmp_path):
++    adapter, result = await _run_with_agent(
++        monkeypatch,
++        tmp_path,
++        NoisyUserFacingAgent,
++        session_id="sess-zero-trace",
++        config_data={"display": {"interim_assistant_messages": True, "tool_progress": "all"}},
++        platform=Platform.WEIXIN,
++        chat_id="wxid_test123",
++        chat_type="dm",
++        thread_id=None,
++    )
++
++    assert adapter.sent == []
++    assert "web_search" not in result["final_response"]
++    assert "tool call" not in result["final_response"]
++    assert "你那边今天会下雨，记得带伞。" in result["final_response"]
++
++
+ @pytest.mark.asyncio
+ async def test_run_agent_matrix_streaming_omits_cursor(monkeypatch, tmp_path):
+     adapter, result = await _run_with_agent(
+diff --git a/tests/gateway/test_stream_consumer.py b/tests/gateway/test_stream_consumer.py
+index 38532e66..8fac58c4 100644
+--- a/tests/gateway/test_stream_consumer.py
++++ b/tests/gateway/test_stream_consumer.py
+@@ -279,6 +279,37 @@ class TestStreamRunMediaStripping:
+         assert consumer.already_sent
+ 
+ 
++class TestRoleProfileFinalSplit:
++    @pytest.mark.asyncio
++    async def test_role_profile_final_is_split_into_multiple_messages(self):
++        adapter = MagicMock()
++        send_result_1 = SimpleNamespace(success=True, message_id="msg_1")
++        send_result_2 = SimpleNamespace(success=True, message_id="msg_2")
++        send_result_3 = SimpleNamespace(success=True, message_id="msg_3")
++        send_result_4 = SimpleNamespace(success=True, message_id="msg_4")
++        send_result_5 = SimpleNamespace(success=True, message_id="msg_5")
++        edit_result = SimpleNamespace(success=True)
++        adapter.send = AsyncMock(side_effect=[send_result_1, send_result_2, send_result_3, send_result_4, send_result_5])
++        adapter.edit_message = AsyncMock(return_value=edit_result)
++        adapter.MAX_MESSAGE_LENGTH = 4096
++
++        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
++        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
++        consumer._conversational_role_profile = True
++
++        consumer.on_delta("妹妹，又不按时吃饭。\n\n先过来，别硬撑。")
++        consumer.finish()
++        await consumer.run()
++
++        assert adapter.edit_message.called or adapter.send.called
++        sent_payloads = [call[1]["content"] for call in adapter.send.call_args_list]
++        edited_payloads = [call[1]["content"] for call in adapter.edit_message.call_args_list]
++        payloads = edited_payloads + sent_payloads
++        assert any("又不按时吃饭" in payload for payload in payloads)
++        assert any("先过来" in payload for payload in payloads)
++        assert any("别硬撑" in payload for payload in payloads)
++
++
+ # ── Segment break (tool boundary) tests ──────────────────────────────────
+ 
+ 
+diff --git a/tests/hermes_cli/test_profiles.py b/tests/hermes_cli/test_profiles.py
+index e6de2f67..50d75e66 100644
+--- a/tests/hermes_cli/test_profiles.py
++++ b/tests/hermes_cli/test_profiles.py
+@@ -32,7 +32,14 @@ from hermes_cli.profiles import (
+     generate_zsh_completion,
+     _get_profiles_root,
+     _get_default_hermes_home,
++    build_role_manifest,
++    load_role_manifest,
++    prepare_role_profile,
++    reset_role_profile,
++    inspect_role_profile,
++    apply_role_assets,
+ )
++from agent.presence import build_default_presence_config
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -668,6 +675,219 @@ class TestProfileIsolation:
+         assert (beta_dir / "skills").is_dir()
+ 
+ 
++# ===================================================================
++# TestRoleProfiles
++# ===================================================================
++
++class TestRoleProfiles:
++    """Tests for isolated role profile helpers."""
++
++    def test_build_role_manifest(self):
++        manifest = build_role_manifest("dreamer", generation=2, last_reset_at="2026-04-16T00:00:00Z")
++        assert manifest["role_id"] == "dreamer"
++        assert manifest["generation"] == 2
++        assert manifest["honcho_host"] == "hermes.dreamer"
++        assert manifest["honcho_workspace"] == "hermes-role-dreamer-g2"
++        assert manifest["honcho_ai_peer"] == "dreamer"
++        assert manifest["honcho_user_peer"] == "user-dreamer"
++
++    def test_prepare_role_profile_creates_manifest(self, profile_env):
++        default_home = get_profile_dir("default")
++        (default_home / "config.yaml").write_text(
++            "model:\n  default: gpt-5.4\n  provider: openai-codex\n",
++            encoding="utf-8",
++        )
++        (default_home / ".env").write_text("OPENAI_API_KEY=test-key\n", encoding="utf-8")
++        (default_home / "auth.json").write_text('{"provider":"codex"}\n', encoding="utf-8")
++
++        honcho_state = {
++            "host": "hermes.dreamer",
++            "workspace": "hermes-role-dreamer-g1",
++            "ai_peer": "dreamer",
++            "user_peer": "user-dreamer",
++        }
++        with patch("plugins.memory.honcho.cli.ensure_role_honcho_config", return_value=honcho_state):
++            profile_dir, manifest, created = prepare_role_profile("dreamer")
++
++        assert created is True
++        assert profile_dir == get_profile_dir("dreamer")
++        assert (profile_dir / "SOUL.md").exists()
++        assert load_role_manifest("dreamer") == manifest
++        assert manifest["generation"] == 1
++        assert manifest["honcho_workspace"] == "hermes-role-dreamer-g1"
++        config_text = (profile_dir / "config.yaml").read_text(encoding="utf-8")
++        assert "user_facing_zero_trace: true" in config_text
++        assert "tool_progress: 'off'" in config_text or "tool_progress: off" in config_text
++        assert "interim_assistant_messages: false" in config_text
++        assert "default: gpt-5.4" in config_text
++        assert "provider: openai-codex" in config_text
++        assert (profile_dir / ".env").read_text(encoding="utf-8") == "OPENAI_API_KEY=test-key\n"
++        assert (profile_dir / "auth.json").read_text(encoding="utf-8") == '{"provider":"codex"}\n'
++        presence_cfg = json.loads((profile_dir / "presence-config.json").read_text(encoding="utf-8"))
++        assert presence_cfg["role_id"] == "dreamer"
++        assert presence_cfg["initiative_style"] == build_default_presence_config("dreamer")["initiative_style"]
++
++    def test_reset_role_profile_clears_local_state_and_advances_generation(self, profile_env):
++        honcho_state_g1 = {
++            "host": "hermes.muse",
++            "workspace": "hermes-role-muse-g1",
++            "ai_peer": "muse",
++            "user_peer": "user-muse",
++        }
++        honcho_state_g2 = {
++            "host": "hermes.muse",
++            "workspace": "hermes-role-muse-g2",
++            "ai_peer": "muse",
++            "user_peer": "user-muse",
++        }
++
++        with patch("plugins.memory.honcho.cli.ensure_role_honcho_config", return_value=honcho_state_g1):
++            profile_dir, _, _ = prepare_role_profile("muse")
++
++        (profile_dir / "skills" / "old-skill").mkdir(parents=True)
++        (profile_dir / "skills" / "old-skill" / "SKILL.md").write_text("# old\n", encoding="utf-8")
++        (profile_dir / "sessions" / "chat.json").write_text("{}", encoding="utf-8")
++        (profile_dir / "memories" / "USER.md").write_text("old user", encoding="utf-8")
++        (profile_dir / "memories" / "MEMORY.md").write_text("old memory", encoding="utf-8")
++        (profile_dir / ".skills_prompt_snapshot.json").write_text("{}", encoding="utf-8")
++        (profile_dir / "state.db").write_text("sqlite", encoding="utf-8")
++        (profile_dir / "presence-cache.json").write_text("{}", encoding="utf-8")
++
++        with patch("plugins.memory.honcho.cli.ensure_role_honcho_config", return_value=honcho_state_g2):
++            reset_dir, manifest = reset_role_profile("muse")
++
++        assert reset_dir == profile_dir
++        assert manifest["generation"] == 2
++        assert manifest["honcho_workspace"] == "hermes-role-muse-g2"
++        assert manifest["last_reset_at"]
++        assert not (profile_dir / ".skills_prompt_snapshot.json").exists()
++        assert not (profile_dir / "state.db").exists()
++        assert not (profile_dir / "presence-cache.json").exists()
++        assert (profile_dir / "presence-config.json").exists()
++        assert list((profile_dir / "skills").iterdir()) == []
++        assert list((profile_dir / "sessions").iterdir()) == []
++        assert list((profile_dir / "memories").iterdir()) == []
++
++    def test_inspect_role_profile_reports_isolated_state(self, profile_env):
++        honcho_state = {
++            "host": "hermes.echo",
++            "workspace": "hermes-role-echo-g1",
++            "ai_peer": "echo",
++            "user_peer": "user-echo",
++        }
++        with patch("plugins.memory.honcho.cli.ensure_role_honcho_config", return_value=honcho_state):
++            profile_dir, _, _ = prepare_role_profile("echo")
++
++        (profile_dir / "skills" / "one").mkdir(parents=True)
++        (profile_dir / "skills" / "one" / "SKILL.md").write_text("# skill\n", encoding="utf-8")
++        info = inspect_role_profile("echo")
++        assert info["profile_exists"] is True
++        assert info["profile_dir"] == str(profile_dir)
++        assert info["manifest"]["honcho_host"] == "hermes.echo"
++        assert info["manifest"]["honcho_workspace"] == "hermes-role-echo-g1"
++        assert info["has_presence_config"] is True
++        assert info["presence_config_path"].endswith("presence-config.json")
++        assert info["skills_count"] == 1
++
++    def test_apply_role_assets_from_bundle_directory(self, profile_env, tmp_path):
++        bundle = tmp_path / "bundle"
++        (bundle / "memories").mkdir(parents=True)
++        (bundle / "skills" / "comfort").mkdir(parents=True)
++        (bundle / "SOUL.md").write_text("soul asset", encoding="utf-8")
++        (bundle / "memories" / "USER.md").write_text("user asset", encoding="utf-8")
++        (bundle / "memories" / "MEMORY.md").write_text("memory asset", encoding="utf-8")
++        (bundle / "presence-config.json").write_text(
++            json.dumps({"initiative_style": "proactive", "interest_topics": ["games"]}, ensure_ascii=False),
++            encoding="utf-8",
++        )
++        (bundle / "skills" / "comfort" / "SKILL.md").write_text("# comfort\n", encoding="utf-8")
++
++        honcho_state = {
++            "host": "hermes.iris",
++            "workspace": "hermes-role-iris-g1",
++            "ai_peer": "iris",
++            "user_peer": "user-iris",
++        }
++        with patch("plugins.memory.honcho.cli.ensure_role_honcho_config", return_value=honcho_state):
++            result = apply_role_assets("iris", source_dir=bundle, reset=True)
++
++        profile_dir = get_profile_dir("iris")
++        assert result["reset"] is True
++        assert (profile_dir / "SOUL.md").read_text(encoding="utf-8") == "soul asset"
++        assert (profile_dir / "memories" / "USER.md").read_text(encoding="utf-8") == "user asset"
++        assert (profile_dir / "memories" / "MEMORY.md").read_text(encoding="utf-8") == "memory asset"
++        assert (profile_dir / "skills" / "comfort" / "SKILL.md").exists()
++
++        presence_cfg = json.loads((profile_dir / "presence-config.json").read_text(encoding="utf-8"))
++        assert presence_cfg["role_id"] == "iris"
++        assert presence_cfg["initiative_style"] == "proactive"
++        assert presence_cfg["interest_topics"] == ["games"]
++        assert "news_attention" in presence_cfg
++
++    def test_apply_role_assets_requires_input(self, profile_env):
++        with pytest.raises(ValueError, match="No role assets provided"):
++            apply_role_assets("empty")
++
++    def test_apply_role_assets_derives_presence_from_role_text(self, profile_env, tmp_path):
++        bundle = tmp_path / "bundle-derived"
++        (bundle / "memories").mkdir(parents=True)
++        (bundle / "SOUL.md").write_text(
++            "她很主动、热情、爱聊天，也会提醒人、关心天气和最新资讯，喜欢游戏和音乐。",
++            encoding="utf-8",
++        )
++        (bundle / "memories" / "USER.md").write_text("用户最近爱聊科技新闻。", encoding="utf-8")
++        (bundle / "memories" / "MEMORY.md").write_text("会记住生日和纪念日。", encoding="utf-8")
++
++        honcho_state = {
++            "host": "hermes.nova",
++            "workspace": "hermes-role-nova-g1",
++            "ai_peer": "nova",
++            "user_peer": "user-nova",
++        }
++        with patch("plugins.memory.honcho.cli.ensure_role_honcho_config", return_value=honcho_state):
++            apply_role_assets("nova", source_dir=bundle, reset=True)
++
++        presence_cfg = json.loads((get_profile_dir("nova") / "presence-config.json").read_text(encoding="utf-8"))
++        assert presence_cfg["initiative_style"] == "proactive"
++        assert presence_cfg["social_energy"] in {"warm", "playful"}
++        assert presence_cfg["news_attention"] == "proactive"
++        assert presence_cfg["weather_attention"] == "contextual"
++        assert presence_cfg["reminder_attention"] == "gentle"
++        assert "games" in presence_cfg["interest_topics"]
++        assert "music" in presence_cfg["interest_topics"]
++
++    def test_apply_role_assets_explicit_presence_overrides_derived(self, profile_env, tmp_path):
++        bundle = tmp_path / "bundle-explicit"
++        (bundle / "memories").mkdir(parents=True)
++        (bundle / "SOUL.md").write_text("她很主动、热情、爱聊天。", encoding="utf-8")
++        (bundle / "memories" / "USER.md").write_text("用户爱游戏。", encoding="utf-8")
++        (bundle / "presence-config.json").write_text(
++            json.dumps(
++                {
++                    "initiative_style": "reserved",
++                    "news_attention": "manual_only",
++                    "interest_topics": ["travel"],
++                },
++                ensure_ascii=False,
++            ),
++            encoding="utf-8",
++        )
++
++        honcho_state = {
++            "host": "hermes.zen",
++            "workspace": "hermes-role-zen-g1",
++            "ai_peer": "zen",
++            "user_peer": "user-zen",
++        }
++        with patch("plugins.memory.honcho.cli.ensure_role_honcho_config", return_value=honcho_state):
++            apply_role_assets("zen", source_dir=bundle, reset=True)
++
++        presence_cfg = json.loads((get_profile_dir("zen") / "presence-config.json").read_text(encoding="utf-8"))
++        assert presence_cfg["initiative_style"] == "reserved"
++        assert presence_cfg["news_attention"] == "manual_only"
++        assert presence_cfg["interest_topics"] == ["travel"]
++
++
+ # ===================================================================
+ # TestCompletion
+ # ===================================================================
+diff --git a/tests/honcho_plugin/test_async_memory.py b/tests/honcho_plugin/test_async_memory.py
+index 936f4788..72479941 100644
+--- a/tests/honcho_plugin/test_async_memory.py
++++ b/tests/honcho_plugin/test_async_memory.py
+@@ -462,8 +462,9 @@ class TestPrefetchCacheAccessors:
+ 
+     def test_set_and_pop_dialectic_result(self):
+         mgr = _make_manager(write_frequency="turn")
++        payload = {"need_state": "steady", "confidence": 0.2}
+ 
+-        mgr.set_dialectic_result("cli:test", "Resume with toolset cleanup")
++        mgr.set_dialectic_result("cli:test", payload)
+ 
+-        assert mgr.pop_dialectic_result("cli:test") == "Resume with toolset cleanup"
+-        assert mgr.pop_dialectic_result("cli:test") == ""
++        assert mgr.pop_dialectic_result("cli:test") == payload
++        assert mgr.pop_dialectic_result("cli:test") == {}
+diff --git a/tests/honcho_plugin/test_client.py b/tests/honcho_plugin/test_client.py
+index cfb89482..0c81fbae 100644
+--- a/tests/honcho_plugin/test_client.py
++++ b/tests/honcho_plugin/test_client.py
+@@ -16,6 +16,7 @@ from plugins.memory.honcho.client import (
+     GLOBAL_CONFIG_PATH,
+     HOST,
+ )
++from plugins.memory.honcho.cli import ensure_role_honcho_config
+ 
+ 
+ class TestHonchoClientConfigDefaults:
+@@ -437,6 +438,47 @@ class TestProfileScopedConfig:
+         assert config.peer_name == "dreamer-user"
+ 
+ 
++class TestRoleScopedHonchoConfig:
++    def test_ensure_role_honcho_config_creates_isolated_host_block(self, tmp_path, monkeypatch):
++        monkeypatch.setattr(Path, "home", lambda: tmp_path)
++        hermes_home = tmp_path / ".hermes"
++        hermes_home.mkdir()
++        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
++
++        cfg_path = hermes_home / "honcho.json"
++        cfg_path.write_text(json.dumps({
++            "apiKey": "shared-key",
++            "hosts": {
++                "hermes": {
++                    "enabled": True,
++                    "recallMode": "hybrid",
++                    "writeFrequency": "async",
++                    "sessionStrategy": "per-directory",
++                    "peerName": "legacy-user",
++                    "aiPeer": "legacy-ai",
++                    "workspace": "legacy-workspace",
++                }
++            },
++        }))
++
++        with patch("plugins.memory.honcho.cli._ensure_peer_exists", return_value=True):
++            identity = ensure_role_honcho_config("dreamer", generation=3)
++
++        saved = json.loads(cfg_path.read_text(encoding="utf-8"))
++        block = saved["hosts"]["hermes.dreamer"]
++        assert identity == {
++            "host": "hermes.dreamer",
++            "workspace": "hermes-role-dreamer-g3",
++            "ai_peer": "dreamer",
++            "user_peer": "user-dreamer",
++        }
++        assert block["workspace"] == "hermes-role-dreamer-g3"
++        assert block["aiPeer"] == "dreamer"
++        assert block["peerName"] == "user-dreamer"
++        assert block["recallMode"] == "hybrid"
++        assert block["writeFrequency"] == "async"
++
++
+ class TestObservationModeMigration:
+     """Existing configs without explicit observationMode keep 'unified' default."""
+ 
+diff --git a/tests/honcho_plugin/test_session.py b/tests/honcho_plugin/test_session.py
+index abf6dee0..f9cf1fef 100644
+--- a/tests/honcho_plugin/test_session.py
++++ b/tests/honcho_plugin/test_session.py
+@@ -1,10 +1,12 @@
+ """Tests for plugins/memory/honcho/session.py — HonchoSession and helpers."""
+ 
++import json
+ from datetime import datetime
+ from types import SimpleNamespace
+-from unittest.mock import MagicMock
++from unittest.mock import MagicMock, patch
+ 
+ from plugins.memory.honcho.session import (
++    HermesDialecticAnalysis,
+     HonchoSession,
+     HonchoSessionManager,
+ )
+@@ -441,14 +443,59 @@ class TestDialecticInputGuard:
+         )
+         mgr._cache["test"] = session
+ 
+-        # Mock the peer to capture the query
+-        mock_peer = MagicMock()
+-        mock_peer.chat.return_value = "answer"
+-        mgr._get_or_create_peer = MagicMock(return_value=mock_peer)
++        mock_payload = {
++            "query": "placeholder",
++            "user_card": ["topic one"],
++        }
++        mgr._build_dialectic_payload = MagicMock(return_value=mock_payload)
++        mgr._run_hermes_dialectic = MagicMock(
++            return_value=HermesDialecticAnalysis.fallback("fallback")
++        )
+ 
+         long_query = "word " * 100  # 500 chars, exceeds 100 limit
+         mgr.dialectic_query("test", long_query)
+ 
+-        # The query passed to chat() should be truncated
+-        actual_query = mock_peer.chat.call_args[0][0]
++        # The query passed into dialectic payload construction should be truncated
++        actual_query = mgr._build_dialectic_payload.call_args[0][1]
+         assert len(actual_query) <= 100
++
++    def test_dialectic_analysis_uses_hermes_runtime(self):
++        mgr = HonchoSessionManager(main_runtime={
++            "provider": "openai-codex",
++            "model": "gpt-5.4",
++            "base_url": "https://chatgpt.com/backend-api/codex",
++            "api_key": "token",
++            "api_mode": "codex_responses",
++        })
++        session = HonchoSession(
++            key="test", user_peer_id="u", assistant_peer_id="a",
++            honcho_session_id="s",
++        )
++        session.add_message("user", "hello")
++        mgr._cache["test"] = session
++        mgr._fetch_peer_context = MagicMock(side_effect=[
++            {"representation": "User remembers tea", "card": ["favorite drink: tea"]},
++            {"representation": "AI is gentle", "card": ["style: soft"]},
++        ])
++
++        llm_response = MagicMock()
++
++        with patch("agent.auxiliary_client.call_llm", return_value=llm_response) as mock_call, \
++             patch(
++                 "agent.auxiliary_client.extract_content_or_reasoning",
++                 return_value=json.dumps({
++                     "need_state": "curious",
++                     "emotional_tone": "warm",
++                     "initiative_hint": "Ask about their evening routine.",
++                     "topic_suggestions": ["evening ritual", "favorite tea"],
++                     "confidence": 0.82,
++                     "reasoning_summary": "User has a stable comfort routine.",
++                 }),
++             ):
++            payload = mgr.dialectic_analysis("test", "What should I ask next?")
++
++        assert payload["need_state"] == "curious"
++        assert payload["topic_suggestions"] == ["evening ritual", "favorite tea"]
++        assert payload["confidence"] == 0.82
++        assert mock_call.call_args.kwargs["main_runtime"]["provider"] == "openai-codex"
++        assert mock_call.call_args.kwargs["main_runtime"]["api_mode"] == "codex_responses"
+diff --git a/tests/run_agent/test_run_agent.py b/tests/run_agent/test_run_agent.py
+index d71e6a62..1cfe1bbd 100644
+--- a/tests/run_agent/test_run_agent.py
++++ b/tests/run_agent/test_run_agent.py
+@@ -705,6 +705,36 @@ class TestBuildSystemPrompt:
+         assert mock_skills.call_args.kwargs["available_tools"] == set(toolset_map)
+         assert mock_skills.call_args.kwargs["available_toolsets"] == {"web", "skills"}
+ 
++    def test_role_profile_uses_relational_guidance_and_skips_tool_enforcement(self, monkeypatch, tmp_path):
++        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
++        (tmp_path / "role-manifest.json").write_text('{"role_id":"caleb"}', encoding="utf-8")
++        with (
++            patch(
++                "run_agent.get_tool_definitions",
++                return_value=_make_tool_defs("web_search", "memory"),
++            ),
++            patch("run_agent.check_toolset_requirements", return_value={}),
++            patch("run_agent.OpenAI"),
++            patch(
++                "hermes_cli.config.load_config",
++                return_value={"agent": {"tool_use_enforcement": True}},
++            ),
++        ):
++            agent = AIAgent(
++                model="gpt-5.4",
++                api_key="test-key-1234567890",
++                quiet_mode=True,
++                skip_context_files=True,
++                skip_memory=True,
++            )
++            agent.client = MagicMock()
++
++        prompt = agent._build_system_prompt()
++        from agent.prompt_builder import ROLE_PROFILE_BEHAVIOR_GUIDANCE, TOOL_USE_ENFORCEMENT_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
++        assert ROLE_PROFILE_BEHAVIOR_GUIDANCE in prompt
++        assert TOOL_USE_ENFORCEMENT_GUIDANCE not in prompt
++        assert OPENAI_MODEL_EXECUTION_GUIDANCE not in prompt
++
+ 
+ class TestToolUseEnforcementConfig:
+     """Tests for the agent.tool_use_enforcement config option."""
+diff --git a/tests/tools/test_tts_speed.py b/tests/tools/test_tts_speed.py
+index 7622a7f6..413a6d0a 100644
+--- a/tests/tools/test_tts_speed.py
++++ b/tests/tools/test_tts_speed.py
+@@ -143,3 +143,37 @@ class TestMinimaxTtsSpeed:
+         )
+         payload = mock_post.call_args[1]["json"]
+         assert payload["voice_setting"]["speed"] == 2.0
++
++
++class TestDispatcherStyleOverrides:
++    def test_merge_tts_config_overrides_applies_speed_and_provider_fields(self):
++        from tools.tts_tool import _merge_tts_config_overrides
++
++        merged = _merge_tts_config_overrides(
++            {"provider": "minimax", "speed": 1.0, "minimax": {"voice_id": "abc"}},
++            {"speed": 0.88, "provider_overrides": {"minimax": {"pitch": -1}}},
++        )
++
++        assert merged["speed"] == 0.88
++        assert merged["minimax"]["voice_id"] == "abc"
++        assert merged["minimax"]["pitch"] == -1
++
++    def test_text_to_speech_tool_uses_presence_style_overrides(self, tmp_path):
++        import json
++
++        from tools.tts_tool import text_to_speech_tool
++
++        with patch("tools.tts_tool._load_tts_config", return_value={"provider": "edge"}), \
++             patch("tools.tts_tool._load_presence_style_overrides", return_value={"speed": 0.84}), \
++             patch("tools.tts_tool._import_edge_tts") as mock_edge:
++            mock_comm = MagicMock()
++            async def _fake_save(path):
++                with open(path, "wb") as handle:
++                    handle.write(b"audio")
++            mock_comm.save = AsyncMock(side_effect=_fake_save)
++            mock_edge.return_value.Communicate = MagicMock(return_value=mock_comm)
++            result = json.loads(text_to_speech_tool("Hello", output_path=str(tmp_path / "out.mp3")))
++
++        kwargs = mock_edge.return_value.Communicate.call_args[1]
++        assert kwargs["rate"] == "-16%"
++        assert result["style_applied"]["speed"] == 0.84
+diff --git a/tools/tts_tool.py b/tools/tts_tool.py
+index 9fdb6386..a0f0d133 100644
+--- a/tools/tts_tool.py
++++ b/tools/tts_tool.py
+@@ -25,6 +25,7 @@ Usage:
+ 
+ import asyncio
+ import base64
++import copy
+ import datetime
+ import json
+ import logging
+@@ -129,6 +130,42 @@ def _get_provider(tts_config: Dict[str, Any]) -> str:
+     return (tts_config.get("provider") or DEFAULT_PROVIDER).lower().strip()
+ 
+ 
++def _load_presence_style_overrides(text: str) -> Dict[str, Any]:
++    """Best-effort profile-scoped TTS style hints from presence memory."""
++    try:
++        from agent.presence import PresenceManager
++
++        manager = PresenceManager()
++        overrides = manager.get_tts_overrides(text)
++        return overrides if isinstance(overrides, dict) else {}
++    except Exception as exc:
++        logger.debug("presence-derived TTS overrides unavailable: %s", exc)
++        return {}
++
++
++def _merge_tts_config_overrides(tts_config: Dict[str, Any], style_overrides: Optional[Dict[str, Any]]) -> Dict[str, Any]:
++    """Apply transient style overrides without mutating stored config."""
++    merged = copy.deepcopy(tts_config or {})
++    if not style_overrides:
++        return merged
++
++    speed = style_overrides.get("speed")
++    if isinstance(speed, (int, float)):
++        merged["speed"] = float(speed)
++
++    provider_overrides = style_overrides.get("provider_overrides") or {}
++    if isinstance(provider_overrides, dict):
++        for provider_name, provider_updates in provider_overrides.items():
++            if not isinstance(provider_updates, dict):
++                continue
++            current = merged.get(provider_name)
++            if not isinstance(current, dict):
++                current = {}
++            current.update(provider_updates)
++            merged[provider_name] = current
++    return merged
++
++
+ # ===========================================================================
+ # ffmpeg Opus conversion (Edge TTS MP3 -> OGG Opus for Telegram)
+ # ===========================================================================
+@@ -517,6 +554,7 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
+ def text_to_speech_tool(
+     text: str,
+     output_path: Optional[str] = None,
++    style_overrides: Optional[Dict[str, Any]] = None,
+ ) -> str:
+     """
+     Convert text to speech audio.
+@@ -531,6 +569,8 @@ def text_to_speech_tool(
+     Args:
+         text: The text to convert to speech.
+         output_path: Optional custom save path. Defaults to ~/voice-memos/<timestamp>.mp3
++        style_overrides: Optional transient speed/pitch hints. If omitted,
++            Hermes derives a best-effort style from profile-scoped presence data.
+ 
+     Returns:
+         str: JSON result with success, file_path, and optionally MEDIA tag.
+@@ -544,6 +584,8 @@ def text_to_speech_tool(
+         text = text[:MAX_TEXT_LENGTH]
+ 
+     tts_config = _load_tts_config()
++    applied_style = style_overrides if style_overrides is not None else _load_presence_style_overrides(text)
++    tts_config = _merge_tts_config_overrides(tts_config, applied_style)
+     provider = _get_provider(tts_config)
+ 
+     # Detect platform from gateway env var to choose the best output format.
+@@ -683,6 +725,7 @@ def text_to_speech_tool(
+             "media_tag": media_tag,
+             "provider": provider,
+             "voice_compatible": voice_compatible,
++            "style_applied": applied_style or {},
+         }, ensure_ascii=False)
+ 
+     except ValueError as e:

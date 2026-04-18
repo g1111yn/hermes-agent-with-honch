@@ -1,0 +1,3 @@
+repo=https://github.com/NousResearch/hermes-agent.git
+commit=722331a5
+patch=vendor/hermes-agent/patches/0001-hermes-local-customizations.patch

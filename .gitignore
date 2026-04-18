@@ -1,0 +1,16 @@
+.env
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+data/tts/
+data/wechat-gateway/
+deploy/.env.shared
+deploy/.env.interface
+deploy/.env.honcho
+deploy/.env.providers
+deploy/host/hermes-host.env
+runtime/
+__pycache__/
+*.pyc
+scripts/__pycache__/

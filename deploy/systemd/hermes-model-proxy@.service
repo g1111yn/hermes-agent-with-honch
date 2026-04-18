@@ -1,0 +1,16 @@
+[Unit]
+Description=Hermes model proxy for Honcho
+After=network-online.target hermes-agent@%i.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/hermes-persona
+EnvironmentFile=/opt/hermes-persona/deploy/host/hermes-host.env
+ExecStart=/opt/hermes-persona/runtime/hermes-agent/venv/bin/python /opt/hermes-persona/scripts/hermes_model_proxy.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

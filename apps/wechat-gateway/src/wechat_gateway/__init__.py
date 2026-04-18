@@ -1,0 +1,1 @@
+"""WeChat gateway distribution package."""
