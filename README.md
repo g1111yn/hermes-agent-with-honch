@@ -41,6 +41,7 @@ ships:
 
 - the pinned upstream commit
 - a binary-safe patch bundle containing your local Hermes customizations
+- overlay files for runtime modules added outside tracked patch state
 - bootstrap scripts that materialize the customized Hermes tree on a fresh host
 
 This keeps the repo lightweight while preserving reproducibility.
