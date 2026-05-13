@@ -1,16 +1,142 @@
-.env
+# =============================================================================
+# Hermes Persona — .gitignore
+#
+# Goal: this repo is the *framework* distribution. We MUST NOT publish:
+#   - any concrete role bundle (persona text, character soul files)
+#   - any user-derived memory (chat-derived facts, peer cards, conclusions)
+#   - any runtime state (sessions, sandboxes, logs, dbs, locks)
+#   - any secret env file or token
+#
+# Templates, examples, and the framework code itself ARE published.
+# =============================================================================
+
+# ----- Python / build artifacts -----
 __pycache__/
 *.pyc
-.DS_Store
+*.pyo
+*.pyd
+*.egg-info/
+.eggs/
 .pytest_cache/
-data/tts/
-data/wechat-gateway/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+.coverage
+.tox/
+.venv/
+venv/
+env/
+
+# ----- OS / editor noise -----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# =============================================================================
+# Secrets / env files — NEVER commit
+# =============================================================================
+.env
+.env.*
+!.env.example
+!*.env.example
+
+# project-specific env files (only the *.example ones are published)
 deploy/.env.shared
 deploy/.env.interface
 deploy/.env.honcho
 deploy/.env.providers
 deploy/host/hermes-host.env
+
+# legacy env relics (PoC stage)
+legacy/.env
+legacy/.env.honcho
+
+# =============================================================================
+# Role bundles — strictly NOT published
+#
+# A role bundle is the persona content itself: identity, voice, memories,
+# skills, presence config. These are user-authored, often private, and the
+# whole point of the framework is to keep them OUT of git.
+#
+# We only publish:
+#   - roles/README.md  (how to author a bundle)
+#   - roles/_template/ (skeleton for new bundles, if present)
+# =============================================================================
+roles/*
+!roles/README.md
+!roles/_template/
+!roles/.gitkeep
+
+# =============================================================================
+# Server runtime state — entirely local to each host
+#
+# server-state/ holds:
+#   - hermes/profiles/*       — active runtime copies of role bundles
+#   - hermes/memories/        — user-facing memory files derived from chat
+#   - hermes/sessions/        — chat session logs
+#   - hermes/sandboxes/       — code-exec sandboxes
+#   - hermes/logs/            — agent runtime logs
+#   - hermes/cron/            — scheduled task state
+#   - hermes/skills/          — runtime-generated skill cache
+#   - gewechat/               — WeChat bridge runtime state, login QR, tokens
+#   - wechat-gateway/         — gateway state (delivered IDs, dedup cache)
+#
+# All of this is generated on the host and must never leak.
+# =============================================================================
+server-state/
+
+# Older single-tree runtime layout — same rules
 runtime/
-__pycache__/
-*.pyc
-scripts/__pycache__/
+
+# =============================================================================
+# Data / databases / caches
+# =============================================================================
+data/
+database/data/
+*.sqlite
+*.sqlite3
+*.db
+*.db-journal
+
+# =============================================================================
+# Vendor extraction — we ship the patch bundle only, not the materialized tree
+#
+# bootstrap_hermes_vendor.sh re-materializes the upstream Hermes worktree
+# locally on each host. The materialized tree itself is huge and not ours
+# to publish.
+# =============================================================================
+vendor/hermes-agent/upstream/
+vendor/hermes-agent/extracted/
+vendor/hermes-agent/.materialized
+
+# =============================================================================
+# Container / build artifacts
+# =============================================================================
+*.log
+*.pid
+*.lock
+docker-compose.override.yml
+
+# =============================================================================
+# Local override files / personal experimentation — never publish
+# =============================================================================
+*.local
+*.local.*
+local/
+private/
+
+# =============================================================================
+# Memory backups — user-derived, never publish
+# =============================================================================
+*.memory.bak
+memories-backup/
+
+# =============================================================================
+# Stray artifacts seen in this tree
+# =============================================================================
+", get_env_value(key))*
+.codex

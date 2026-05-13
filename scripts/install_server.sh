@@ -50,12 +50,14 @@ copy_if_missing "$ROOT/deploy/host/hermes-host.env.example" "$TARGET_ROOT/deploy
 
 install -m 0644 "$ROOT/deploy/systemd/hermes-agent@.service" /etc/systemd/system/hermes-agent@.service
 install -m 0644 "$ROOT/deploy/systemd/hermes-model-proxy@.service" /etc/systemd/system/hermes-model-proxy@.service
+install -m 0644 "$ROOT/deploy/systemd/hermes-self-wake@.service" /etc/systemd/system/hermes-self-wake@.service
+install -m 0644 "$ROOT/deploy/systemd/hermes-self-wake@.timer" /etc/systemd/system/hermes-self-wake@.timer
 systemctl daemon-reload
 
 if [[ $START_SERVICES -eq 1 ]]; then
-  systemctl enable --now "hermes-agent@${SERVICE_USER}.service" "hermes-model-proxy@${SERVICE_USER}.service"
+  systemctl enable --now "hermes-agent@${SERVICE_USER}.service" "hermes-model-proxy@${SERVICE_USER}.service" "hermes-self-wake@${SERVICE_USER}.timer"
 else
-  systemctl enable "hermes-agent@${SERVICE_USER}.service" "hermes-model-proxy@${SERVICE_USER}.service"
+  systemctl enable "hermes-agent@${SERVICE_USER}.service" "hermes-model-proxy@${SERVICE_USER}.service" "hermes-self-wake@${SERVICE_USER}.timer"
 fi
 
 cat <<EOF

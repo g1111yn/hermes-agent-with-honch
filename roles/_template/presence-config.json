@@ -1,0 +1,10 @@
+{
+  "initiative_style": "balanced",
+  "social_energy": "warm",
+  "weather_attention": "contextual",
+  "news_attention": "off",
+  "reminder_attention": "gentle",
+  "nearby_attention": "off",
+  "voice_style": "neutral",
+  "interest_topics": []
+}

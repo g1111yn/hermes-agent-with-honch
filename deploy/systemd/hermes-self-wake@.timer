@@ -1,0 +1,13 @@
+[Unit]
+Description=Hermes self-wake scheduler
+
+[Timer]
+Unit=hermes-self-wake@%i.service
+OnBootSec=8min
+OnUnitActiveSec=17min
+RandomizedDelaySec=11min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+

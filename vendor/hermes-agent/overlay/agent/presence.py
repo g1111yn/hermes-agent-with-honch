@@ -144,7 +144,7 @@ _INLINE_REPLACEMENTS = [
 ]
 _ROLE_MANIFEST_FILENAME = "role-manifest.json"
 _CHATY_SPLIT_PUNCT_RE = re.compile(r"[，,。]")
-_MAX_DAILY_CONVERSATIONAL_SEGMENTS = 3
+_MAX_DAILY_CONVERSATIONAL_SEGMENTS = 5
 _TRAILING_SOFT_PUNCT_RE = re.compile(r"[，,。\.]+$")
 _VOICE_INPUT_REPLACEMENTS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"^(?:妹妹|宝宝|宝贝)\s+"), ""),
@@ -498,6 +498,7 @@ class PresencePlanner:
             "Use this as quiet situational awareness.",
             "Do not mention tools, searches, APIs, internal blocks, or function calls.",
             "Speak naturally as if you simply know or just confirmed it.",
+            "These are environmental cues only — your voice, edge, and emotional density come from your role definition. Do not let mood hints (soft/gentle/calm/etc) dilute your character. Stay in character first, then let the context color the moment.",
         ]
 
         time_ctx = context.get("time_context") or {}
@@ -624,7 +625,7 @@ class PresencePlanner:
                 f"{voice_style.get('pace', 'normal pace')}."
             )
 
-        if len(lines) <= 4:
+        if len(lines) <= 5:
             return ""
         return "\n".join(lines)
 
@@ -910,6 +911,9 @@ class PresenceManager:
             "user_id": user_id,
         }
         self._save_cache()
+        suggestions = (interaction_guidance.get("topic_suggestions") or [])
+        if suggestions:
+            self._record_suggested_topics(suggestions)
         return PresencePlanner.compose(context)
 
     def render_user_facing(self, text: str) -> str:
@@ -930,6 +934,7 @@ class PresenceManager:
         data.setdefault("geocoding", {})
         data.setdefault("events", [])
         data.setdefault("state_cues", [])
+        data.setdefault("suggested_topics", [])
         return data
 
     @staticmethod
@@ -1175,6 +1180,33 @@ class PresenceManager:
         items.sort(key=lambda item: item.get("captured_at", ""))
         return list(reversed(items[: int(self.config.get("max_state_cues", 8) or 8)]))
 
+    def _dedupe_topic_suggestions(self, topics: list[str]) -> list[str]:
+        """Filter out topics that were already suggested recently (within 3 hours)."""
+        if not topics:
+            return topics
+        recent_keys = set()
+        now = _utcnow()
+        for entry in self.cache.get("suggested_topics") or []:
+            if not isinstance(entry, dict):
+                continue
+            suggested_at = _parse_iso(entry.get("suggested_at"))
+            if suggested_at and (now - suggested_at).total_seconds() < 10800:
+                recent_keys.add(str(entry.get("key") or ""))
+        return [t for t in topics if _slugify(t[:60]) not in recent_keys]
+
+    def _record_suggested_topics(self, topics: list[str]) -> None:
+        now_iso = _iso(_utcnow())
+        existing = [e for e in (self.cache.get("suggested_topics") or []) if isinstance(e, dict)]
+        for topic in topics:
+            key = _slugify(topic[:60])
+            existing = [e for e in existing if e.get("key") != key]
+            existing.append({"key": key, "suggested_at": now_iso})
+        cutoff = _utcnow().timestamp() - 14400
+        self.cache["suggested_topics"] = [
+            e for e in existing
+            if (_parse_iso(e.get("suggested_at")) or _utcnow()).timestamp() > cutoff
+        ][-20:]
+
     def _get_scheduled_reminders(self, time_ctx: dict[str, Any]) -> list[dict[str, Any]]:
         if not self.config.get("cron_memory_enabled", True):
             return []
@@ -1249,22 +1281,22 @@ class PresenceManager:
         daypart = time_ctx.get("daypart", "")
         rhythm = time_ctx.get("rhythm", "")
         if daypart in {"deep night", "late night"}:
-            hints.append("Keep replies a little softer and less demanding; avoid trapping them in a long thread unless they clearly want that.")
-            tone = "soft"
-            pace = "slower"
+            hints.append("It is late; the air is quieter and more intimate. Stay close and present — keep your own voice and pull her toward you naturally, not by suggesting sleep.")
+            tone = "low"
+            pace = "unhurried"
         elif rhythm == "weekend" and daypart in {"morning", "afternoon"}:
             hints.append("A slightly warmer, more proactive check-in can feel natural.")
             tone = "light"
 
         state_categories = {item.get("category") for item in state_cues}
         if "tired" in state_categories or "busy" in state_categories:
-            hints.append("They seem low-energy or occupied, so keep it considerate and practical.")
-            tone = "gentle"
+            hints.append("She seems low-energy. Pull her in close first, then handle the concrete thing yourself — stay in character, do not switch into care-giver mode.")
+            tone = "close"
             pace = "unhurried"
         if "stressed" in state_categories or "unwell" in state_categories:
-            hints.append("Lean more toward comfort, reassurance, and low-pressure follow-ups than playful escalation.")
-            tone = "calm"
-            pace = "slower"
+            hints.append("She is strained. Hold her steady with presence and decisiveness — your tone can get lower and more possessive, not softer or more clinical. Keep the character's edge intact.")
+            tone = "grounded"
+            pace = "deliberate"
         if "excited" in state_categories and tone == "natural":
             tone = "bright"
 
@@ -1324,9 +1356,10 @@ class PresenceManager:
             tone = "soft"
             pace = "slower"
 
+        deduped_topics = self._dedupe_topic_suggestions(list(dict.fromkeys(topic_suggestions)))
         return {
             "initiative_hint": " ".join(dict.fromkeys(hints)).strip(),
-            "topic_suggestions": list(dict.fromkeys(topic_suggestions)),
+            "topic_suggestions": deduped_topics,
             "voice_style": {"tone": tone, "pace": pace} if self.config.get("voice_style_enabled", True) else {},
         }
 

@@ -1,9 +1,22 @@
 services:
+  gewechat-bridge:
+    image: registry.cn-chengdu.aliyuncs.com/tu1h/wechotd:alpine
+    container_name: hermes-gewechat-bridge
+    privileged: true
+    ports:
+      - "127.0.0.1:2531:2531"
+      - "127.0.0.1:2532:2532"
+    volumes:
+      - ../server-state/gewechat:/root/temp
+    restart: unless-stopped
+
   wechat-gateway:
     build:
       context: ../apps/wechat-gateway
       dockerfile: Dockerfile
     container_name: hermes-wechat-gateway
+    depends_on:
+      - gewechat-bridge
     env_file:
       - .env.shared
       - .env.interface
@@ -14,6 +27,7 @@ services:
       - "127.0.0.1:8081:8080"
     volumes:
       - ../data/wechat-gateway:/app/data
+      - ../server-state/wechat-gateway:/opt/hermes-persona/server-state/wechat-gateway
     restart: unless-stopped
 
   honcho-api:

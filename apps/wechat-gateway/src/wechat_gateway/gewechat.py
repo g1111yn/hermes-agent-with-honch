@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -9,6 +10,7 @@ from typing import Any
 
 
 GEWECHAT_TEXT_MSG_TYPE = 1
+GEWECHAT_IMAGE_MSG_TYPE = 3
 GEWECHAT_VOICE_MSG_TYPE = 34
 
 
@@ -54,12 +56,30 @@ class GewechatClient:
             },
         )
 
+    def download_image(self, *, msg_id: str, app_id: str | None = None) -> bytes | None:
+        """Download an image from Gewechat by message ID. Returns raw bytes or None on failure."""
+        try:
+            result = self._post("/tools/downloadImage", {"appId": app_id or self.config.app_id, "msgId": msg_id})
+            data = result.get("data")
+            if isinstance(data, str) and data:
+                return base64.b64decode(data)
+            if isinstance(data, dict):
+                b64 = str(data.get("fileBase64") or data.get("base64") or "").strip()
+                if b64:
+                    return base64.b64decode(b64)
+        except Exception:
+            pass
+        return None
+
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.config.token:
+            headers["X-GEWE-TOKEN"] = self.config.token
         request = urllib.request.Request(
             f"{self.config.api_base}{path}",
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -70,7 +90,7 @@ def parse_gewechat_callback(payload: dict[str, Any]) -> GewechatInboundEvent | N
     data = payload.get("Data") or {}
     add_msg = data.get("AddMsg") or {}
     msg_type = _as_int(add_msg.get("MsgType"))
-    if msg_type not in {GEWECHAT_TEXT_MSG_TYPE, GEWECHAT_VOICE_MSG_TYPE}:
+    if msg_type not in {GEWECHAT_TEXT_MSG_TYPE, GEWECHAT_IMAGE_MSG_TYPE, GEWECHAT_VOICE_MSG_TYPE}:
         return None
 
     app_id = str(payload.get("Appid") or payload.get("appId") or "").strip()
@@ -81,18 +101,26 @@ def parse_gewechat_callback(payload: dict[str, Any]) -> GewechatInboundEvent | N
     if wxid and from_user == wxid:
         return None
 
+    is_image = msg_type == GEWECHAT_IMAGE_MSG_TYPE
     raw_content = _normalize_text(str(add_msg.get("Content") or ""))
-    if not raw_content:
-        return None
 
-    is_group = from_user.endswith("@chatroom")
-    speaker_id = from_user
-    text = raw_content
-    ats = ""
-
-    if is_group:
-        speaker_id, text = _split_group_speaker(raw_content)
-        ats = _extract_mentions(raw_content)
+    if is_image:
+        text = "[图片]"
+        is_group = from_user.endswith("@chatroom")
+        speaker_id = from_user
+        ats = ""
+        if is_group:
+            speaker_id, _ = _split_group_speaker(raw_content)
+    else:
+        if not raw_content:
+            return None
+        is_group = from_user.endswith("@chatroom")
+        speaker_id = from_user
+        text = raw_content
+        ats = ""
+        if is_group:
+            speaker_id, text = _split_group_speaker(raw_content)
+            ats = _extract_mentions(raw_content)
 
     new_msg_id = str(add_msg.get("NewMsgId") or add_msg.get("MsgId") or "").strip()
     message_id = str(add_msg.get("MsgId") or new_msg_id).strip()
@@ -111,6 +139,8 @@ def parse_gewechat_callback(payload: dict[str, Any]) -> GewechatInboundEvent | N
         "new_msg_id": new_msg_id,
         "msg_type": msg_type,
     }
+    if is_image:
+        metadata["image_msg_id"] = message_id
     if is_group:
         metadata["group_id"] = from_user
         metadata["speaker_id"] = speaker_id
